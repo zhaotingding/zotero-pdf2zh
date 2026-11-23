@@ -20,6 +20,7 @@ from utils.config import Config
 from utils.config_map import pdf2zh_next_service_aliases
 from utils.config_migration import prepare_config_files
 from utils.cropper import Cropper
+from utils.auto_outline import attach_outlines
 import traceback
 import argparse
 import sys  # 用于退出脚本
@@ -149,6 +150,7 @@ class PDFTranslator:
             'status': 'ok',
             'version': __version__,
             'message': 'PDF2zh Server is running',
+            'autoOutline': 'source-bookmarks-or-local-headings',
             'outputDir': os.path.abspath(output_folder),
         }), 200
 
@@ -633,6 +635,11 @@ class PDFTranslator:
             task_manager.complete_task(task_id, 'failed', '操作失败，请查看详细日志。', error='无文件生成')
             return {'status': 'error', 'message': '操作失败，请查看详细日志。'}
 
+        try:
+            attach_outlines(input_path, existing, config, self, engine)
+        except Exception:
+            print("⚠️ 自动补大纲未完成，仍然返回已经生成的译本。")
+            traceback.print_exc()
         payload = self._success_files_payload(existing)
         task_manager.complete_task(
             task_id,
