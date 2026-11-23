@@ -4,3 +4,6 @@ pypdf
 argparse
 PyMuPDF
 packaging
+numpy
+Pillow
+scipy

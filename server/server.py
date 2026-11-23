@@ -21,6 +21,7 @@ from utils.config_map import pdf2zh_next_service_aliases
 from utils.config_migration import prepare_config_files
 from utils.cropper import Cropper
 from utils.auto_outline import attach_outlines
+from utils.page_overlay import repair_translation_outputs
 import traceback
 import argparse
 import sys  # 用于退出脚本
@@ -151,6 +152,7 @@ class PDFTranslator:
             'version': __version__,
             'message': 'PDF2zh Server is running',
             'autoOutline': 'source-bookmarks-or-local-headings',
+            'repairPageOverlays': True,
             'outputDir': os.path.abspath(output_folder),
         }), 200
 
@@ -1073,6 +1075,7 @@ class PDFTranslator:
         existing = [path for path in output_files if os.path.isfile(path)]
         if not existing:
             raise RuntimeError("翻译进程结束但未生成预期 PDF，请查看翻译日志。")
+        repair_translation_outputs(input_path, existing)
         return existing
 
     def translate_pdf_next(self, input_path, config, task_id=None):
@@ -1239,6 +1242,7 @@ class PDFTranslator:
         if not existing:
             raise RuntimeError("操作失败，请查看详细日志。")
 
+        repair_translation_outputs(input_path, existing)
         return existing
 
     def run(self, host, port, debug=False):
