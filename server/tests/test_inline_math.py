@@ -4,9 +4,61 @@ from tempfile import TemporaryDirectory
 
 import pymupdf as pdf
 from utils.inline_fractions import finalize_inline_fonts, prepare_inline_fractions
+from utils.inline_math import _codes
 
 
 class InlineMathTests(unittest.TestCase):
+    def test_variable_with_multiletter_subscript_or_exponent_remains_one_math_run(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp, "variables.pdf")
+            with pdf.open() as doc:
+                page = doc.new_page()
+                for y, base, script, shift in [
+                    (65, "u", "j2", 1.7),
+                    (105, "k", "3", -3.1),
+                ]:
+                    page.insert_text((40, y), "The estimate is", fontsize=10)
+                    page.insert_text((118, y), base, fontsize=10, fontname="tiit")
+                    x = 118 + pdf.get_text_length(base, fontname="tiit", fontsize=10)
+                    page.insert_text(
+                        (x + 0.2, y + shift), script, fontsize=7, fontname="cour"
+                    )
+                    page.insert_text((150, y), "for this sample.", fontsize=10)
+                page.insert_text((40, 155), "A normal word", fontsize=10)
+                x = 40 + pdf.get_text_length("A normal word", fontsize=10)
+                page.insert_text((x, 152), "1", fontsize=7)
+                page.insert_text(
+                    (40, 180), "Different sizes with a shared baseline:", fontsize=10
+                )
+                page.insert_text((240, 180), "v", fontsize=10)
+                page.insert_text((245, 180), "s", fontsize=7)
+                doc.save(path)
+            with prepare_inline_fractions(str(path)) as (prepared, maps):
+                self.assertTrue(maps)
+                with pdf.open(prepared) as marked, pdf.open(path) as original:
+                    self.assertEqual(
+                        marked[0].get_pixmap().digest, original[0].get_pixmap().digest
+                    )
+                    masked = [
+                        c
+                        for s in marked[0].get_texttrace()
+                        for c in s["chars"]
+                        if c[0] == 0xE000
+                    ]
+                    self.assertEqual(len(masked), 5)
+                    self.assertTrue(all(c[2][1] < 120 for c in masked))
+                finalize_inline_fonts([prepared], maps)
+                with pdf.open(prepared) as restored, pdf.open(path) as original:
+                    self.assertEqual(restored[0].get_text(), original[0].get_text())
+
+    def test_named_glyphs_without_unicode_map_follow_the_rendered_character(self):
+        encoding = {47: "/", 65: "/y.alt", 66: "/afii10069.ital", 67: "/NoSuchGlyph"}
+        self.assertEqual(
+            _codes(b"/ABC", encoding, {}),
+            [(b"/", "/"), (b"A", "y"), (b"B", "д"), (b"C", "/NoSuchGlyph")],
+        )
+        self.assertEqual(_codes(b"A", encoding, {"/y.alt": "Y"}), [(b"A", "Y")])
+
     def test_formulas_and_prose_can_share_one_text_show_and_one_font(self):
         for composite in (False, True):
             with self.subTest(composite=composite), TemporaryDirectory() as tmp:

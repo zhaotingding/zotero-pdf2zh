@@ -7,6 +7,7 @@ from collections import defaultdict
 from itertools import pairwise
 from typing import NamedTuple
 
+import pymupdf as pdf
 from pypdf._cmap import get_encoding
 from pypdf.generic import (
     ArrayObject,
@@ -39,6 +40,55 @@ _RELATION = re.compile(
 )
 _ARG_WORD = re.compile(rf"(?:{_FUNCTIONS})\Z")
 _ACCENTS = frozenset("^ˆ˜~¯ˉ˙¨ˇ˘´`→")
+_PRIMES = frozenset("′″‴")
+
+
+def script_ranges(places):
+    """Find a variable plus its attached script using the source PDF's baselines."""
+    for i, (base, script) in enumerate(pairwise(places)):
+        if base is None or script is None or not base.char.isalpha() or base.size <= 0:
+            continue
+        if not (
+            script.char.isalnum() or script.char in _PRIMES or script.char in "*+-−"
+        ):
+            continue
+        if (
+            script.x <= base.x
+            or not -0.2 * base.size <= script.x - base.right <= 0.23 * base.size
+        ):
+            continue
+        ratio = script.size / base.size
+        shift = (script.y - base.y) / base.size
+        stacked = 0.4 <= ratio <= 0.89 and 0.085 <= abs(shift) <= 0.75
+        prime = (
+            script.char in _PRIMES and 0.4 <= ratio <= 1.10 and -0.8 <= shift <= 0.08
+        )
+        if not (stacked or prime):
+            continue
+        # 紧随普通单词的上标往往是脚注。变量可以与正文同字体，真正的词界由字距给出。
+        prev = places[i - 1] if i else None
+        if (
+            prev
+            and prev.char.isalnum()
+            and prev.font == base.font
+            and abs(prev.y - base.y) < 0.1 * base.size
+            and base.x - prev.right < 0.16 * base.size
+        ):
+            continue
+        end = i + 2
+        while end < len(places):
+            g = places[end]
+            last = places[end - 1]
+            if (
+                g is None
+                or not (g.char.isalnum() or g.char in _PRIMES or g.char in "+−-*,")
+                or abs(g.y - script.y) > 0.10 * script.size
+                or abs(g.size - script.size) > 0.10 * script.size
+                or not -0.15 * script.size <= g.x - last.right <= 0.23 * script.size
+            ):
+                break
+            end += 1
+        yield i, end
 
 
 def _mark_line(line, selected):
@@ -90,6 +140,9 @@ def _mark_line(line, selected):
 
     for match in _RELATION.finditer(text):
         mark(*match.span())
+    # 主字母和上下标必须进入同一公式占位符，译文换行时才能保留原字形与相对位置。
+    for start, end in script_ranges(places):
+        mark(start, end)
     for i, (a, b) in enumerate(pairwise(places)):
         if a is None or b is None:
             continue
@@ -176,7 +229,17 @@ def _codes(data, encoding, cmap):
         codes = ((bytes([c]), chr(c)) for c in data)
     else:
         return []
-    return [(raw, cmap.get(char, char)) for raw, char in codes]
+    result = []
+    for raw, char in codes:
+        value = cmap.get(char, char)
+        # 无 ToUnicode 的 Type 1 可用 /y.alt 等字形名。沿用产生 texttrace 的
+        # MuPDF 解码约定，否则一个替代字形就会让整页同字体的坐标校验失败。
+        if char not in cmap and len(char) > 1 and char.startswith("/"):
+            scalar = pdf.mupdf.fz_unicode_from_glyph_name(char[1:])
+            if scalar not in (0, 0xFFFD):
+                value = chr(scalar)
+        result.append((raw, value))
+    return result
 
 
 def _math_paints(ops, fonts, slots, edits):
