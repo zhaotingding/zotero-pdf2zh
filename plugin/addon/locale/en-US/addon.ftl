@@ -48,3 +48,8 @@ operation-batch-completed =
 operation-error-no-files = The server did not return any files to import.
 operation-error-completed-no-files = The task completed, but the Server returned no files.
 operation-error-partial-attachments = Imported only { $attached }/{ $total } attachment(s): { $message }
+
+task-reconnecting = Contact with the task was lost. Reconnecting…
+task-offline = The translation server is offline. Check the service before translating the original PDF again.
+task-missing = The server no longer has this task, possibly after a restart. Start again from the original PDF.
+task-already-running = This attachment is already being processed.

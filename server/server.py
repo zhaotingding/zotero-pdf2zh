@@ -32,7 +32,11 @@ import socket  # 用于端口检查
 import time    # 用于 SSE 推送间隔
 import threading
 import uuid    # 用于生成任务唯一标识
-from datetime import datetime  # 用于记录任务开始/结束时间
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from utils.job_worker import run_isolated  # 用于记录任务开始/结束时间
 # 导入自动更新模块
 from utils.auto_update import check_for_updates, fetch_and_show_notices, perform_update_optimized
 # 导入任务管理器（用于 index.html 前端进度显示）
@@ -100,11 +104,34 @@ class _QuietAccessHandler(WSGIRequestHandler):
         super().log_request(code, size)
 
 
+def process_pdf_job(options, environment, operation, task_id, input_path, config, *, progress):
+    # 此函数在独立进程内执行；临时输出目录只属于当前任务。
+    global args, output_folder
+    args = options
+    output_folder = os.path.dirname(input_path)
+    task_manager.progress_sink = progress
+    processor = PDFTranslator(options, environment=environment)
+    engine = config.engine
+    if operation == "/translate":
+        return processor._execute_translate_job(task_id, input_path, config, engine)
+    if operation == "/crop":
+        return processor._execute_crop_job(input_path, config)
+    filetype = processor.get_filetype(input_path)
+    if operation == "/crop-compare":
+        return processor._execute_crop_compare_job(task_id, input_path, config, engine, filetype)
+    if operation == "/compare":
+        return processor._execute_compare_job(task_id, input_path, config, engine, filetype)
+    raise ValueError(f"未知 PDF 操作 {operation}")
+
+
 class PDFTranslator:
 
-    def __init__(self, args):
+    def __init__(self, args, *, environment=None):
+        self.options = args
+        self.jobs = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pdf2zh-jobs")
         self.app = Flask(__name__)
-        if args.enable_venv:
+        self.env_manager = environment
+        if args.enable_venv and environment is None:
             self.env_manager = VirtualEnvManager(config_path[venv], venv_name, args.env_tool, args.enable_mirror, args.skip_install, args.mirror_source)
         self.cropper = Cropper()
         self.setup_routes()
@@ -137,6 +164,7 @@ class PDFTranslator:
         # 新增：历史记录 API - 供 index.html 前端获取翻译历史
         self.app.add_url_rule('/api/history', 'history', self.get_history)
         self.app.add_url_rule('/api/tasks', 'tasks', self.get_tasks)
+        self.app.add_url_rule('/api/tasks/<task_id>', 'task', self.get_task)
         # 新增：配置信息 API - 供 index.html 前端显示当前服务配置
         self.app.add_url_rule('/api/config', 'config', self.get_config)
         # 新增：favicon 路由
@@ -203,6 +231,12 @@ class PDFTranslator:
     ##################################################################
     def get_history(self):
         return jsonify({'status': 'success', 'history': task_manager.get_history()})
+
+    def get_task(self, task_id):
+        task = task_manager.get_task(task_id)
+        if task is None:
+            return jsonify({"status": "missing"}), 404
+        return jsonify({"status": "success", "task": task})
 
     def get_tasks(self):
         return jsonify({'status': 'success', 'tasks': task_manager.get_active_tasks_list()})
@@ -284,10 +318,7 @@ class PDFTranslator:
         except Exception as exc:
             raise ValueError(f"Invalid PDF content: {exc}") from exc
 
-        with open(input_path, 'wb') as f:
-            f.write(decoded)
-
-        return input_path, config
+        return input_path, config, decoded
 
     def _existing_output_files(self, paths):
         existing = []
@@ -385,35 +416,68 @@ class PDFTranslator:
         protocol = str(data.get('clientProtocol') or '').strip().lower()
         return protocol in {'accepted', 'async'}
 
-    def _start_accepted_job(self, task_id, task_info, worker, context):
-        # 新插件：POST 立刻 accepted，翻完后按 taskId 取结果，避免 Windows 长连接被掐。
-        # 旧插件：阻塞到完成，再返回 {status: success, fileList, ...}。
-        task_manager.add_task(task_id, task_info)
-        if self._client_wants_async_job():
-            def run():
-                try:
-                    worker()
-                except Exception as exc:
-                    task_manager.complete_task(task_id, 'failed', str(exc), error=str(exc))
-                    self._exception_payload(exc, context=context)
-
-            threading.Thread(target=run, daemon=True).start()
-            return jsonify({'status': 'accepted', 'taskId': task_id}), 200
-
-        print(f"ℹ️ [Zotero PDF2zh Server] 旧插件协议：同步等待完成后返回 fileList ({context})")
+    def _start_accepted_job(self, task_id, task_info, contents, config, operation):
+        # 接收时隔离同名上传。工作进程串行使用翻译配置，已完成的文件才发布到原有目录。
+        work = TemporaryDirectory(prefix=".pdf2zh-job-", dir=output_folder, ignore_cleanup_errors=True)
+        path = Path(work.name, task_info["fileName"])
         try:
-            payload = worker() or {}
-            if payload.get('status') == 'error':
-                return jsonify(payload), 500
-            if payload.get('status') != 'success':
-                return jsonify({
-                    'status': 'error',
-                    'message': payload.get('message') or '操作失败，请查看详细日志。',
-                }), 500
-            return jsonify(payload), 200
+            path.write_bytes(contents)
+            task_info.update(status="排队中", message="已加入队列，等待处理")
+            task_manager.add_task(task_id, task_info)
+            scoped = request.headers.get("X-PDF2zh-Task-Files") == "1"
+            future = self.jobs.submit(self._run_job, task_id, work, path, config, operation, scoped)
+        except Exception:
+            work.cleanup()
+            raise
+        if self._client_wants_async_job():
+            return jsonify({"status": "accepted", "taskId": task_id, "taskStatus": True}), 200
+        try:
+            return jsonify(future.result()), 200
         except Exception as exc:
-            task_manager.complete_task(task_id, 'failed', str(exc), error=str(exc))
-            return self._handle_exception(exc, context=context)
+            return self._handle_exception(exc, context=operation)
+
+    def _run_job(self, task_id, work, path, config, operation, scoped):
+        kept = False
+        try:
+            task_manager.update_task(task_id, {"status": "处理中", "message": "正在启动 PDF 工作进程"})
+            result = run_isolated(
+                process_pdf_job, (self.options, self.env_manager, operation, task_id, str(path), config),
+                lambda update: task_manager.update_task(task_id, update),
+            )
+            if result.get("status") != "success" or not result.get("fileList"):
+                raise RuntimeError(result.get("message") or "工作进程没有生成 PDF")
+            names = result["fileList"]
+            for name in names:
+                if Path(name).name != name or not (path.parent / name).is_file():
+                    raise RuntimeError("任务返回了无效的输出文件")
+            for product in path.parent.glob("*.pdf"):
+                destination = Path(output_folder, product.name)
+                if scoped and product.name in names:
+                    # 本机通常使用硬链接。随后有同名任务时，前一个客户端仍能下载自己的结果。
+                    publish = path.parent / ".publishing"
+                    try:
+                        os.link(product, publish)
+                    except OSError:
+                        shutil.copyfile(product, publish)
+                    os.replace(publish, destination)
+                else:
+                    os.replace(product, destination)
+            payload = self._success_files_payload([str(Path(output_folder, name)) for name in names])
+            if scoped:
+                payload["taskFiles"] = True
+                payload["taskId"] = task_id
+                payload["filePaths"] = [str(path.parent / name) for name in names]
+                task_manager.keep_result(task_id, work, names)
+                kept = True
+            task_manager.complete_task(task_id, "success", "PDF 已生成", file_list=names,
+                                       file_paths=payload["filePaths"], output_dir=output_folder, result=payload)
+            return payload
+        except Exception as exc:
+            task_manager.complete_task(task_id, "failed", str(exc), error=str(exc))
+            raise
+        finally:
+            if not kept:
+                work.cleanup()
 
     def _complete_job_files(self, task_id, paths, message):
         payload = self._success_files_payload(paths)
@@ -487,6 +551,12 @@ class PDFTranslator:
             if os.path.commonpath([base, full]) != base:
                 return jsonify({'status': 'error', 'message': 'Invalid path'}), 400
 
+            scoped = request.args.get("taskId")
+            if scoped:
+                full = task_manager.result_file(scoped, filename)
+                if not full:
+                    return jsonify({"status": "error", "message": "任务文件已过期"}), 404
+
             if os.path.exists(full):
                 # 如果 preview=true，则以内联方式返回（用于浏览器内预览）
                 is_preview = request.args.get('preview') == 'true'
@@ -505,7 +575,7 @@ class PDFTranslator:
         start_time = datetime.now()
 
         try:
-            input_path, config = self.process_request()
+            input_path, config, contents = self.process_request()
             infile_type = self.get_filetype(input_path)
             engine = config.engine
             task_info = self._build_task_info(
@@ -515,14 +585,18 @@ class PDFTranslator:
             if infile_type != 'origin':
                 return jsonify({'status': 'error', 'message': 'Input file must be an original PDF file.'}), 400
 
+            # Zotero 可重命名译本文件。优先使用生成器标记识别；中文原稿仍可正常翻译。
+            with PdfReader(io.BytesIO(contents)) as reader:
+                producer = str((reader.metadata or {}).get("/Producer", "")).lower()
+            if producer.startswith("babeldoc") and "translation_generated_by_ai" in producer:
+                return jsonify({"status": "error", "errorType": "TranslatedInput",
+                                "message": "所选附件已经是 PDF2zh 译本，请选择同一文献下的原始 PDF 再翻译。"}), 409
             return self._start_accepted_job(
                 task_id,
                 task_info,
-                lambda: self._execute_translate_job(task_id, input_path, config, engine),
-                '/translate',
+                contents, config, '/translate',
             )
         except Exception as e:
-            task_manager.complete_task(task_id, 'failed', str(e), error=str(e))
             return self._handle_exception(e, context='/translate')
 
     def _execute_translate_job(self, task_id, input_path, config, engine):
@@ -744,40 +818,34 @@ class PDFTranslator:
 
     # 裁剪 /crop
     def crop(self):
+        task_id = str(uuid.uuid4())
         try:
-            input_path, config = self.process_request()
-            infile_type = self.get_filetype(input_path)
+            input_path, config, contents = self.process_request()
+            if self.get_filetype_after_crop(input_path) == "unknown":
+                return jsonify({"status": "error", "errorType": "InvalidPDFOperation",
+                                "message": "请选择可裁剪的原文、mono 或 dual 文件。"}), 400
+            info = self._build_task_info(task_id, input_path, config, config.engine, datetime.now())
+            return self._start_accepted_job(task_id, info, contents, config, "/crop")
+        except Exception as exc:
+            return self._handle_exception(exc, context="/crop")
 
-            source_path = input_path
-            if infile_type == 'dual' and self.get_dual_mode(input_path, config.dual_mode) == 'LR':
-                # Crop means a crop result, not merely a layout conversion.
-                # Normalize LR -> alternating-page TB internally, then continue
-                # through the normal dual -> dual-cut operation.
-                _, source_path = self.cropper.pdf_dual_mode(input_path, 'LR', 'TB')
-
-            new_type = self.get_filetype_after_crop(input_path)
-            if new_type == 'unknown':
-                return jsonify({
-                    'status': 'error',
-                    'errorType': 'InvalidPDFOperation',
-                    'message': f'当前 PDF 类型 {infile_type} 不能再次执行裁剪。请选择原文、mono 或 dual 文件。'
-                }), 400
-
-            new_path = self.get_filename_after_process(input_path, new_type, config.engine)
-            self.cropper.crop_pdf(config, source_path, infile_type, new_path, new_type)
-            print(f"🔍 [Zotero PDF2zh Server] 开始裁剪文件: {source_path}, {infile_type}, 裁剪类型: {new_type}, {new_path}")
-
-            if os.path.exists(new_path):
-                return self._success_files_response([new_path])
-            return jsonify({'status': 'error', 'message': f'Crop failed: {new_path} not found'}), 500
-        except Exception as e:
-            return self._handle_exception(e, context='/crop')
+    def _execute_crop_job(self, input_path, config):
+        infile_type = self.get_filetype(input_path)
+        source_path = input_path
+        if infile_type == "dual" and self.get_dual_mode(input_path, config.dual_mode) == "LR":
+            _, source_path = self.cropper.pdf_dual_mode(input_path, "LR", "TB")
+        new_type = self.get_filetype_after_crop(input_path)
+        new_path = self.get_filename_after_process(input_path, new_type, config.engine)
+        self.cropper.crop_pdf(config, source_path, infile_type, new_path, new_type)
+        if not os.path.isfile(new_path):
+            raise RuntimeError("裁剪结束但没有生成 PDF")
+        return self._success_files_payload([new_path])
 
     def crop_compare(self):
         task_id = str(uuid.uuid4())
         start_time = datetime.now()
         try:
-            input_path, config = self.process_request()
+            input_path, config, contents = self.process_request()
             infile_type = self.get_filetype(input_path)
             engine = config.engine
 
@@ -800,13 +868,9 @@ class PDFTranslator:
             return self._start_accepted_job(
                 task_id,
                 task_info,
-                lambda: self._execute_crop_compare_job(
-                    task_id, input_path, config, engine, infile_type
-                ),
-                '/crop-compare',
+                contents, config, '/crop-compare',
             )
         except Exception as e:
-            task_manager.complete_task(task_id, 'failed', str(e), error=str(e))
             return self._handle_exception(e, context='/crop-compare')
 
     def _execute_crop_compare_job(self, task_id, input_path, config, engine, infile_type):
@@ -854,7 +918,7 @@ class PDFTranslator:
         task_id = str(uuid.uuid4())
         start_time = datetime.now()
         try:
-            input_path, config = self.process_request()
+            input_path, config, contents = self.process_request()
             infile_type = self.get_filetype(input_path)
             engine = config.engine
 
@@ -877,13 +941,9 @@ class PDFTranslator:
             return self._start_accepted_job(
                 task_id,
                 task_info,
-                lambda: self._execute_compare_job(
-                    task_id, input_path, config, engine, infile_type
-                ),
-                '/compare',
+                contents, config, '/compare',
             )
         except Exception as e:
-            task_manager.complete_task(task_id, 'failed', str(e), error=str(e))
             return self._handle_exception(e, context='/compare')
 
     def _execute_compare_job(self, task_id, input_path, config, engine, infile_type):

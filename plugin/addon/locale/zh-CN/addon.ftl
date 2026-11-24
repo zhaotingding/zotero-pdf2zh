@@ -48,3 +48,8 @@ operation-batch-completed =
 operation-error-no-files = 服务器未返回可导入的文件
 operation-error-completed-no-files = 任务已完成，但 Server 未返回任何文件
 operation-error-partial-attachments = 仅导入 { $attached }/{ $total } 个附件：{ $message }
+
+task-reconnecting = 与任务状态暂时失去联系，正在重新连接…
+task-offline = 翻译服务连接中断，请检查服务后再从原始 PDF 发起翻译。
+task-missing = 服务已经没有这项任务的记录，可能刚重启过。请从原始 PDF 重新发起。
+task-already-running = 已在处理所选附件，本次点击不会重复提交。

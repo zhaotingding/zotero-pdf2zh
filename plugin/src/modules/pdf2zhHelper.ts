@@ -1,6 +1,7 @@
 import { getPref } from "../utils/prefs";
 import { getString } from "../utils/locale";
 import { version as pluginVersion } from "../../package.json";
+import { visibleTask } from "./pdf2zhTaskPolling";
 import { FileProcessor } from "./pdf2zhFileProcessor";
 import { ensureTranslationService } from "./pdf2zhLocalService";
 import {
@@ -25,6 +26,8 @@ export class PDF2zhHelperFactory {
     // Server may report completion before its file metadata is visible to the
     // polling endpoint. Allow a short grace period, never the full job timeout.
     private static readonly COMPLETED_FILE_GRACE_MS = 20_000;
+
+    private static readonly inFlight = new Set<string>();
 
     // **** 由hooks.ts调用, main entries *****
     static async processWorker(
@@ -79,31 +82,53 @@ export class PDF2zhHelperFactory {
             return;
         }
 
-        const progress = JobProgressPopup.open(
-            tasks.map((task) => task.fileName),
+        const keyOf = (item: Zotero.Item) =>
+            endpoint + "/" + item.libraryID + "/" + item.id;
+        const fresh = tasks.filter(
+            (task) => !this.inFlight.has(keyOf(task.item)),
         );
-        const fileProcessor = FileProcessor.getInstance();
-        if (endpoint === "translate") {
-            try {
-                await ensureTranslationService(
-                    tasks[0].config.serverUrl,
-                    () => progress.waitForService(),
-                    getString,
-                );
-            } catch (error) {
-                progress.complete(0, tasks.length);
-                ztoolkit.getGlobal("alert")(String(error));
-                return;
-            }
+        if (!fresh.length) {
+            new ztoolkit.ProgressWindow(getString("operation-progress-title"), {
+                closeTime: 3000,
+                closeOtherProgressWindows: false,
+            })
+                .createLine({
+                    text: getString("task-already-running"),
+                    type: "default",
+                })
+                .show();
+            return;
         }
+        for (const task of fresh) this.inFlight.add(keyOf(task.item));
         try {
-            const result = await fileProcessor.processBatch(tasks, (update) => {
-                progress.updateFile(update);
-            });
-            progress.complete(result.succeeded, result.failed);
-        } catch (error) {
-            progress.complete(0, tasks.length);
-            throw error;
+            const progress = JobProgressPopup.open(
+                fresh.map((task) => task.fileName),
+            );
+            if (endpoint === "translate") {
+                try {
+                    await ensureTranslationService(
+                        fresh[0].config.serverUrl,
+                        () => progress.waitForService(),
+                        getString,
+                    );
+                } catch (error) {
+                    progress.complete(0, fresh.length);
+                    ztoolkit.getGlobal("alert")(String(error));
+                    return;
+                }
+            }
+            try {
+                const result = await FileProcessor.getInstance().processBatch(
+                    fresh,
+                    (update) => progress.updateFile(update),
+                );
+                progress.complete(result.succeeded, result.failed);
+            } catch (error) {
+                progress.complete(0, fresh.length);
+                throw error;
+            }
+        } finally {
+            for (const task of fresh) this.inFlight.delete(keyOf(task.item));
         }
     }
 
@@ -350,6 +375,7 @@ export class PDF2zhHelperFactory {
                 headers: {
                     "Content-Type": "application/json",
                     "X-PDF2zh-Protocol": "accepted",
+                    "X-PDF2zh-Task-Files": "1",
                     "X-PDF2zh-Plugin-Version": pluginVersion,
                 },
                 body: JSON.stringify(requestBody),
@@ -394,15 +420,20 @@ export class PDF2zhHelperFactory {
                     fileName: fileData.fileName,
                     endpoint,
                 });
-                return this.waitForAcceptedTask(config, taskId, (running) => {
-                    onProgress?.({
-                        phase: "running",
-                        fileName: fileData.fileName,
-                        endpoint,
-                        percent: running.percent,
-                        detail: running.message,
-                    });
-                });
+                return this.waitForAcceptedTask(
+                    config,
+                    taskId,
+                    (running) => {
+                        onProgress?.({
+                            phase: "running",
+                            fileName: fileData.fileName,
+                            endpoint,
+                            percent: running.percent,
+                            detail: running.message,
+                        });
+                    },
+                    result.taskStatus === true,
+                );
             }
             return result;
         });
@@ -511,67 +542,67 @@ export class PDF2zhHelperFactory {
     static async fetchTaskRecord(
         config: ServerConfig,
         taskId: string,
+        exact: boolean,
     ): Promise<Record<string, unknown> | undefined> {
         const base = this.normalizeServerUrl(config.serverUrl);
-        try {
-            const tasksRes = await fetch(`${base}/api/tasks`, {
-                cache: "no-store",
+        const get = async (url: string) =>
+            Zotero.HTTP.request("GET", base + url, {
+                timeout: 4000,
+                responseType: "json",
+                noCache: true,
+                successCodes: false,
+                errorDelayMax: 0,
             });
-            const tasksData = tasksRes.ok
-                ? ((await tasksRes.json()) as {
-                      tasks?: Array<Record<string, unknown>>;
-                  })
-                : { tasks: [] };
-            const tasks = Array.isArray(tasksData.tasks) ? tasksData.tasks : [];
-            const matched = tasks.find(
-                (task) => this.taskIdFromPayload(task) === taskId,
-            );
-            if (matched) {
-                return matched;
+        if (exact) {
+            const res = await get("/api/tasks/" + encodeURIComponent(taskId));
+            if (res.status === 404) return undefined;
+            if (
+                res.status !== 200 ||
+                this.taskIdFromPayload(res.response?.task ?? {}) !== taskId
+            ) {
+                throw new Error("Invalid task response");
             }
-            const historyRes = await fetch(`${base}/api/history`, {
-                cache: "no-store",
-            });
-            const historyData = historyRes.ok
-                ? ((await historyRes.json()) as {
-                      history?: Array<Record<string, unknown>>;
-                  })
-                : { history: [] };
-            const history = Array.isArray(historyData.history)
-                ? historyData.history
-                : [];
-            return history.find(
-                (task) => this.taskIdFromPayload(task) === taskId,
-            );
-        } catch (error) {
-            ztoolkit.log("读取翻译任务状态失败:", error);
-            return undefined;
+            return res.response.task;
         }
-    }
-
-    static async fetchCompletedTask(
-        config: ServerConfig,
-        taskId: string,
-    ): Promise<{
-        status: string;
-        message?: string;
-        [key: string]: unknown;
-    } | null> {
-        const task = await this.fetchTaskRecord(config, taskId);
-        return this.completedTaskPayload(task, taskId);
+        // Older servers publish separate lists. A network error differs from two valid empty lists.
+        for (const name of ["tasks", "history"]) {
+            const res = await get("/api/" + name);
+            const entries = res.response?.[name];
+            if (res.status !== 200 || !Array.isArray(entries))
+                throw new Error("Invalid task list");
+            const task = entries.find(
+                (entry) => this.taskIdFromPayload(entry) === taskId,
+            );
+            if (task) return task;
+        }
+        return undefined;
     }
 
     static async waitForAcceptedTask(
         config: ServerConfig,
         taskId: string,
         onRunning?: (info: { percent: number; message: string }) => void,
+        exactStatus = false,
     ): Promise<{ status: string; message?: string; [key: string]: unknown }> {
         // Zotero 插件沙箱没有 AbortController / ReadableStream / EventSource，
         // 不能去拉无限的 /events。POST 已经成功开工，这里只等这个 taskId 结束。
         const deadline = Date.now() + 3 * 60 * 60 * 1000;
         let completedWithoutFilesSince: number | null = null;
         while (Date.now() < deadline) {
-            const task = await this.fetchTaskRecord(config, taskId);
+            const task = await visibleTask(
+                () => this.fetchTaskRecord(config, taskId, exactStatus),
+                exactStatus,
+                () =>
+                    onRunning?.({
+                        percent: 0,
+                        message: getString("task-reconnecting"),
+                    }),
+                (state) =>
+                    getString(
+                        state === "offline" ? "task-offline" : "task-missing",
+                    ),
+                (ms) => Zotero.Promise.delay(ms),
+            );
             const payload = this.completedTaskPayload(task, taskId);
             if (payload) {
                 if (payload.status === "error") {
@@ -648,6 +679,11 @@ export class PDF2zhHelperFactory {
                     item,
                     options,
                     type: fileType,
+                    taskId:
+                        response.taskFiles === true &&
+                        typeof response.taskId === "string"
+                            ? response.taskId
+                            : undefined,
                     localPath:
                         typeof filePaths[i] === "string" ? filePaths[i] : "",
                     outputDir,
@@ -761,15 +797,20 @@ export class PDF2zhHelperFactory {
         return (serverUrl || "").trim().replace(/\/+$/, "");
     }
 
-    static translatedFileUrl(serverUrl: string, fileName: string): string {
-        return `${this.normalizeServerUrl(serverUrl)}/translatedFile/${encodeURIComponent(fileName)}`;
+    static translatedFileUrl(
+        serverUrl: string,
+        fileName: string,
+        taskId?: string,
+    ): string {
+        return `${this.normalizeServerUrl(serverUrl)}/translatedFile/${encodeURIComponent(fileName)}${taskId ? "?taskId=" + encodeURIComponent(taskId) : ""}`;
     }
 
     static async downloadTranslatedFile(
         fileName: string,
         config: ServerConfig,
+        taskId?: string,
     ): Promise<Uint8Array> {
-        const url = this.translatedFileUrl(config.serverUrl, fileName);
+        const url = this.translatedFileUrl(config.serverUrl, fileName, taskId);
         const response = await fetch(url, { method: "GET" });
         if (!response.ok) {
             throw new Error(`下载失败 HTTP ${response.status}: ${fileName}`);
@@ -889,6 +930,7 @@ export class PDF2zhHelperFactory {
         options: PDFOperationOptions;
         type: string;
         localPath?: string;
+        taskId?: string;
         outputDir?: string;
         retries?: number;
         attachKeys: Set<string>;
@@ -903,6 +945,7 @@ export class PDF2zhHelperFactory {
                     const bytes = await this.downloadTranslatedFile(
                         fileName,
                         config,
+                        params.taskId,
                     );
                     const tempPath = await this.writeTempPdf(bytes);
                     try {
@@ -942,7 +985,7 @@ export class PDF2zhHelperFactory {
         for (const localPath of this.localPathCandidates(
             fileName,
             params.localPath,
-            params.outputDir,
+            params.taskId ? undefined : params.outputDir,
         )) {
             try {
                 const attached = await this.attachFromLocalPath({

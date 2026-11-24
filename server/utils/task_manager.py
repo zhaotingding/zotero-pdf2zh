@@ -34,6 +34,8 @@ class TaskManager:
         self.active_tasks = {}
         self.lock = threading.Lock()
         self.progress_history = []
+        self.progress_sink = None
+        self.result_dirs = {}
 
     @staticmethod
     def _task_snapshot(task_id, task):
@@ -55,6 +57,9 @@ class TaskManager:
             # _debug_progress_log("TASK_ADD", task=self._task_snapshot(task_id, self.active_tasks[task_id]))
 
     def update_task(self, task_id, updates):
+        if self.progress_sink:
+            self.progress_sink(updates)
+            return
         with self.lock:
             if task_id in self.active_tasks:
                 self.active_tasks[task_id].update(updates)
@@ -65,6 +70,7 @@ class TaskManager:
                 # )
 
     def complete_task(self, task_id, status, message=None, file_list=None, error=None, file_paths=None, output_dir=None, result=None):
+        expired = None
         with self.lock:
             if task_id not in self.active_tasks:
                 return
@@ -116,9 +122,12 @@ class TaskManager:
 
             self.progress_history.insert(0, history_item)
             if len(self.progress_history) > 200:
-                self.progress_history = self.progress_history[:200]
+                removed = self.progress_history.pop()
+                expired = self.result_dirs.pop(removed["taskId"], None)
 
             threading.Thread(target=self._delayed_remove, args=(task_id,), daemon=True).start()
+        if expired:
+            expired[0].cleanup()
 
     def get_active_tasks_list(self):
         with self.lock:
@@ -128,6 +137,24 @@ class TaskManager:
     def get_history(self):
         with self.lock:
             return list(self.progress_history)
+
+    def get_task(self, task_id):
+        with self.lock:
+            task = self.active_tasks.get(task_id)
+            if task is None:
+                task = next((item for item in self.progress_history if item["taskId"] == task_id), None)
+            return dict(task) if task else None
+
+    def keep_result(self, task_id, directory, filenames):
+        with self.lock:
+            self.result_dirs[task_id] = (directory, frozenset(filenames))
+
+    def result_file(self, task_id, filename):
+        with self.lock:
+            saved = self.result_dirs.get(task_id)
+            if saved and filename in saved[1]:
+                return os.path.join(saved[0].name, filename)
+            return None
 
     def _delayed_remove(self, task_id):
         time.sleep(30)

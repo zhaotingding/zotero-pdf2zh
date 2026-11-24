@@ -1,6 +1,7 @@
 // lifecycle hooks
 import { PDF2zhBasicFactory, PDF2zhUIFactory } from "./modules/pdf2zh";
 import { PDF2zhHelperFactory } from "./modules/pdf2zhHelper";
+import { closePDF2zhProgressWindows } from "./modules/pdf2zhProgressWindows";
 import { getString, initLocale } from "./utils/locale";
 import { registerPrefsScripts, initTableUI } from "./modules/preferenceScript";
 
@@ -11,6 +12,7 @@ async function onStartup() {
         Zotero.uiReadyPromise,
     ]);
     initLocale(); // 初始化多语言
+    closePDF2zhProgressWindows();
     PDF2zhBasicFactory.registerPrefs(); // 注册偏好设置
     await Promise.all(
         Zotero.getMainWindows().map((win) => onMainWindowLoad(win)),
@@ -54,6 +56,7 @@ async function onMainWindowUnload(win: Window): Promise<void> {
 }
 
 function onShutdown(): void {
+    closePDF2zhProgressWindows();
     ztoolkit.unregisterAll();
     addon.data.dialog?.window?.close();
     // Remove addon object

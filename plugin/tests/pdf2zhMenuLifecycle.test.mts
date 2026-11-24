@@ -141,6 +141,7 @@ function setup() {
     });
     const hooks = load("../src/hooks.ts", {
         "./modules/pdf2zh": factory,
+        "./modules/pdf2zhProgressWindows": { closePDF2zhProgressWindows() {} },
         "./utils/locale": locale,
         "./utils/ztoolkit": { createZToolkit },
         "./modules/preferenceScript": { initTableUI() {} },
