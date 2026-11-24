@@ -14,7 +14,7 @@ from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 from utils.inline_fractions import prepare_inline_fractions, restore_commas
 
 
-def write_fixture(path, with_prose=True):
+def write_fixture(path, with_prose=True, with_commas=True):
     writer = PdfWriter()
     cmap = DecodedStreamObject()
     cmap.set_data(b"""begincmap
@@ -63,6 +63,8 @@ BT /M 5 Tf 1 0 0 1 45 140 Tm (,p) Tj ET
 0.4 w q 1 0 0 1 20 110 cm 0 0 m 100 0 l S Q
 """
         )
+        if not with_commas:
+            stream.set_data(stream.get_data().replace(b"(,p)", b"(ap)", 2))
         page[NameObject("/Contents")] = writer._add_object(stream)
     writer.add_outline_item(title="Section", page_number=0)
     writer.write(path)
@@ -123,6 +125,22 @@ class InlineFractionTests(unittest.TestCase):
                     self.assertEqual(prepared, str(self.source))
                     self.assertFalse(maps)
 
+    def test_plain_denominator_moves_with_fraction_without_private_comma_maps(self):
+        write_fixture(self.source, with_commas=False)
+        with prepare_inline_fractions(str(self.source), skip_last=1) as (
+            prepared,
+            maps,
+        ):
+            self.assertNotEqual(str(prepared), str(self.source))
+            self.assertFalse(maps)
+            with pdf.open(prepared) as doc, pdf.open(self.source) as source:
+                self.assertEqual([d["type"] for d in doc[0].get_drawings()], ["f", "s"])
+                self.assertEqual([d["type"] for d in doc[1].get_drawings()], ["s", "s"])
+                self.assertEqual(doc[0].get_text(), source[0].get_text())
+                self.assertEqual(
+                    doc[0].get_pixmap().digest, source[0].get_pixmap().digest
+                )
+
     def test_server_restores_text_before_downstream_repairs(self):
         from server import PDFTranslator
 
@@ -155,3 +173,15 @@ class InlineFractionTests(unittest.TestCase):
             run.assert_called_once()
             downstream.assert_called_once()
             self.assertFalse(Path(run.call_args.args[0]).exists())
+
+    def test_visual_mismatch_reverts_only_affected_page(self):
+        with (
+            patch("utils.inline_fractions.same_appearance", side_effect=[False, True]),
+            prepare_inline_fractions(str(self.source)) as (prepared, maps),
+            pdf.open(prepared) as doc,
+        ):
+            self.assertTrue(maps)
+            self.assertEqual([s["type"] for s in doc[0].get_drawings()], ["s", "s"])
+            self.assertEqual([s["type"] for s in doc[1].get_drawings()], ["f", "s"])
+            self.assertNotIn("﹐", doc[0].get_text())
+            self.assertIn("﹐", doc[1].get_text())

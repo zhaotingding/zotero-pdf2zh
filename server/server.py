@@ -21,7 +21,7 @@ from utils.config_map import pdf2zh_next_service_aliases
 from utils.config_migration import prepare_config_files
 from utils.cropper import Cropper
 from utils.auto_outline import attach_outlines
-from utils.inline_fractions import prepare_inline_fractions, restore_commas
+from utils.inline_fractions import finalize_inline_fonts, prepare_inline_fractions
 from utils.page_overlay import repair_translation_outputs
 import traceback
 import argparse
@@ -1083,10 +1083,11 @@ class PDFTranslator:
         return existing
 
     def translate_pdf_next(self, input_path, config, task_id=None):
-        # 临时输入保留原文件名；还原公式字符后再裁切、补大纲或交给 Zotero。
+        # 临时输入保留原文件名；恢复数学字体后再裁切、补大纲或交给 Zotero。
         with prepare_inline_fractions(input_path, config.skip_last_pages) as (prepared, maps):
             outputs = self._run_pdf2zh_next(prepared, config, task_id)
-            restore_commas(outputs, maps)
+            if prepared != input_path:
+                finalize_inline_fonts(outputs, maps)
         repair_translation_outputs(input_path, outputs)
         return outputs
 
