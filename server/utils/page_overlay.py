@@ -6,7 +6,6 @@ import shutil
 import tempfile
 import time
 from dataclasses import dataclass
-from hashlib import sha256
 from pathlib import Path
 
 import numpy as np
@@ -152,9 +151,43 @@ def find_overlays(source):
                     boxes = figure_boxes(structure.pages[page.number], page)
                     boxes = art_regions(page, ref, raw, boxes)
                     if boxes is not None:
-                        digest = sha256(doc.xref_stream_raw(im[0])).digest()
+                        # 译本可能重新压缩相同的位图，按解码后的像素匹配。
+                        digest = pdf.Pixmap(doc, im[0]).digest
                         found[digest] = Overlay(size, im[2:4], boxes, txt)
     return found
+
+
+def covers_translated_text(page, clip, source_text):
+    source_text = "".join(source_text.split())
+    if "".join(page.get_text(clip=clip).split()) == source_text:
+        return False
+    # bboxlog 与 texttrace 的序号共用同一绘制顺序；只计这一侧整页图下的可见文字。
+    paints = [
+        i
+        for i, (kind, box) in enumerate(page.get_bboxlog())
+        if kind == "fill-image" and max(abs(a - b) for a, b in zip(box, clip)) < 1
+    ]
+    if len(paints) != 1:
+        return False
+    text = "".join(
+        chr(char[0])
+        for span in page.get_texttrace()
+        if span["seqno"] < paints[0]
+        and span["type"] in (0, 1)
+        and span["opacity"] > 0
+        and pdf.Rect(span["bbox"]).intersects(clip)
+        for char in span["chars"]
+        if 0 <= char[0] <= 0x10FFFF
+    )
+    translated = "".join(text.split())
+    return (
+        len(translated) >= 120
+        and sum(
+            translated[j : j + 8] not in source_text
+            for j in range(0, len(translated) - 7, 8)
+        )
+        >= 8
+    )
 
 
 def restore_output(path, overlays):
@@ -177,19 +210,19 @@ def restore_output(path, overlays):
                     continue
                 for ref in [owner] if owner else page.get_contents():
                     stream = doc.xref_stream(ref)
-                    if (
-                        b"BT" not in stream
-                        or b"/" + name.encode("ascii") + b" Do" not in stream
-                    ):
+                    if b"/" + name.encode("ascii") not in stream:
                         continue
                     matches = list(paint_pattern(name).finditer(stream))
                     if len(matches) != 1:
                         continue
                     m = matches[0]
+                    # 独立页面内容流可以仅绘制图片；共享 Form 仍需包含译文绘图指令。
+                    if b"BT" not in stream and (owner or stream.strip() != m[0]):
+                        continue
                     dims = (float(m[1]), float(m[4]))
                     if not any(full_size(m, o.size) for o in overlays.values()):
                         continue
-                    overlay = overlays.get(sha256(doc.xref_stream_raw(xref)).digest())
+                    overlay = overlays.get(pdf.Pixmap(doc, xref).digest)
                     if not overlay or not full_size(m, overlay.size):
                         continue
                     # 双语版含两份相同位图；通过所属 Form 的位置排除英文原文一侧。
@@ -203,18 +236,7 @@ def restore_output(path, overlays):
                         top = parent
                     if abs(clip.width - dims[0]) > 1 or abs(clip.height - dims[1]) > 1:
                         continue
-                    translated = "".join(page.get_text(clip=clip).split())
-                    source_text = "".join(overlay.source_text.split())
-                    if len(translated) < 120 or translated == source_text:
-                        continue
-                    # 原文侧可能仅更改了字符顺序或增加页脚；正文必须确实出现了大量新文本。
-                    if (
-                        sum(
-                            translated[j : j + 8] not in source_text
-                            for j in range(0, len(translated) - 7, 8)
-                        )
-                        < 8
-                    ):
+                    if not covers_translated_text(page, clip, overlay.source_text):
                         continue
                     # 写入 PDF 原生裁剪路径，图片像素、底层翻译文本和批注坐标保持一致。
                     # 每个区域单独作矩形裁剪，避免复杂裁剪蒙版改变细线和图中文字的采样。
@@ -223,7 +245,10 @@ def restore_output(path, overlays):
                         rect = f"{b.x0:.4f} {dims[1] - b.y1:.4f} {b.width:.4f} {b.height:.4f}"
                         fragments.append(b"q " + rect.encode() + b" re W n " + m[0][1:])
                     replacement = b"\n".join(fragments) or b"q Q"
-                    updates[ref] = stream[: m.start()] + replacement + stream[m.end() :]
+                    target = (None if owner else page.number, ref)
+                    updates[target] = (
+                        stream[: m.start()] + replacement + stream[m.end() :]
+                    )
                     changed.add(page.number + 1)
         if not changed:
             return []
@@ -234,8 +259,21 @@ def restore_output(path, overlays):
         # 增量写入和原子替换，保留所有原始页对象和书签。
         shutil.copyfile(path, tmp)
         with pdf.open(tmp) as copy:
-            for ref, stream in updates.items():
-                copy.update_stream(ref, stream)
+            for (page_number, ref), stream in updates.items():
+                if page_number is None:
+                    copy.update_stream(ref, stream)
+                    continue
+                # 不同页可复用同一个绘图流。把修正后的流只挂到目标页。
+                page = copy[page_number]
+                new_ref = copy.get_new_xref()
+                copy.update_object(new_ref, "<<>>")
+                copy.update_stream(new_ref, stream)
+                refs = [new_ref if x == ref else x for x in page.get_contents()]
+                copy.xref_set_key(
+                    page.xref,
+                    "Contents",
+                    "[" + " ".join(f"{x} 0 R" for x in refs) + "]",
+                )
             copy.saveIncr()
         with pdf.open(tmp) as check:
             if len(check) != page_count or check.get_toc(False) != toc:
