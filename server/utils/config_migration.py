@@ -160,9 +160,10 @@ def _migrate_toml(active: Path, example: Path) -> None:
         print(f"✅ [配置迁移] {active.name}: 无需修改。")
 
 
-def migrate_config_file(active_path: str | os.PathLike[str]) -> None:
+def migrate_config_file(active_path: str | os.PathLike[str], *, example_dir: Path | None = None) -> None:
     active = Path(active_path)
-    example = active.with_name(active.name + ".example")
+    template_root = active.parent if example_dir is None else example_dir
+    example = template_root / (active.name + ".example")
     if not example.exists():
         if not active.exists():
             raise FileNotFoundError(f"缺少配置文件及模板: {active}")
@@ -176,8 +177,9 @@ def migrate_config_file(active_path: str | os.PathLike[str]) -> None:
         shutil.copy2(example, active)
 
 
-def prepare_config_files(config_paths: dict[str, str]) -> None:
+def prepare_config_files(config_paths: dict[str, str], *, example_dir: str | None = None) -> None:
     print("🔍 [配置文件] 检查并迁移配置...")
+    templates = Path(example_dir) if example_dir is not None else None
     for path in config_paths.values():
-        migrate_config_file(path)
+        migrate_config_file(path, example_dir=templates)
     print("✅ [配置文件] 配置检查完成\n")

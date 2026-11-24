@@ -61,8 +61,9 @@ else:
 
 # 所有系统: 获取当前脚本server.py所在的路径
 root_path     = os.path.dirname(os.path.abspath(__file__))
-config_folder = os.path.join(root_path, 'config')
-output_folder = os.path.join(root_path, 'translated')
+data_root     = os.path.abspath(os.environ.get('ZOTERO_PDF2ZH_DATA_DIR') or root_path)
+config_folder = os.path.join(data_root, 'config')
+output_folder = os.path.join(data_root, 'translated')
 config_path = { # 配置文件路径
     pdf2zh:      os.path.join(config_folder, 'config.json'),
     pdf2zh_next: os.path.join(config_folder, 'config.toml'),
@@ -153,6 +154,8 @@ class PDFTranslator:
             'message': 'PDF2zh Server is running',
             'autoOutline': 'source-bookmarks-or-local-headings',
             'repairPageOverlays': True,
+            'serverFile': os.path.abspath(__file__),
+            'sourceRevision': os.environ.get('ZOTERO_PDF2ZH_SOURCE_REVISION'),
             'outputDir': os.path.abspath(output_folder),
         }), 200
 
@@ -1261,7 +1264,7 @@ def prepare_path():
     os.makedirs(output_folder, exist_ok=True)
     # Never overwrite an existing user config with the .example template.
     # Migration only adds missing defaults; user/custom values always win.
-    prepare_config_files(config_path)
+    prepare_config_files(config_path, example_dir=os.path.join(root_path, 'config'))
 
 # ================================================================================
 # ######################### 主程序入口 ############################
@@ -1311,6 +1314,8 @@ if __name__ == '__main__':
     print("🚀 启动参数:", args, "\n")
     print("🏠 当前版本: ", __version__)
     print("🏠 当前路径: ", root_path, "\n")
+    if os.environ.get('ZOTERO_PDF2ZH_SOURCE_REVISION'):
+        print("Git 修订:", os.environ['ZOTERO_PDF2ZH_SOURCE_REVISION'])
 
     # 4. 环境检查（端口、目录权限、Python版本、虚拟环境）
     print("🔍 开始环境检查...")
@@ -1339,7 +1344,7 @@ if __name__ == '__main__':
     ]
 
     for dir_name, description in required_dirs:
-        dir_path = os.path.join(root_path, dir_name)
+        dir_path = os.path.join(data_root, dir_name)
         if not os.path.exists(dir_path):
             print(f"⚠️  {description} ({dir_name}) 不存在，尝试创建...")
             try:

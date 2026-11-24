@@ -1,4 +1,5 @@
 """Start the local Zotero PDF2zh service using this project's Conda runtime."""
+import argparse
 import os
 import socket
 import subprocess
@@ -51,6 +52,10 @@ def api_key(window):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="启动当前源码目录的 Zotero PDF2zh 翻译服务")
+    parser.add_argument("--data-dir", type=Path, help="包含 config 和 translated 的服务数据目录")
+    args = parser.parse_args()
+    server_dir = ROOT / "server"
     window = Tk()
     window.withdraw()
     window.attributes("-topmost", True)
@@ -66,7 +71,19 @@ def main():
     # 模型由插件在每个翻译任务中指定；环境变量会覆盖任务配置。
     env = os.environ.copy()
     env.pop("PDF2ZH_OPENAI_MODEL", None)
-    prefix = ROOT / "runtime"
+    prefix = Path(sys.executable).resolve().parent
+    if args.data_dir is not None:
+        env["ZOTERO_PDF2ZH_DATA_DIR"] = str(args.data_dir.resolve())
+    # 在启动时记录修订号；后续提交只有在服务重启后才会加载。
+    env.pop("ZOTERO_PDF2ZH_SOURCE_REVISION", None)
+    if (ROOT / ".git").exists():
+        try:
+            env["ZOTERO_PDF2ZH_SOURCE_REVISION"] = subprocess.check_output(
+                ["git", "describe", "--always", "--dirty"], cwd=ROOT,
+                stderr=subprocess.DEVNULL, text=True,
+            ).strip()
+        except (OSError, subprocess.CalledProcessError):
+            pass
     env.update({
         "PATH": os.pathsep.join([str(prefix), str(prefix / "Scripts"),
                                  str(prefix / "Library" / "bin"), env["PATH"]]),
@@ -76,9 +93,9 @@ def main():
         "PDF2ZH_OPENAI_SEND_TEMPRATURE": "false",
     })
     return subprocess.call(
-        [sys.executable, "server.py", "--host=127.0.0.1", "--port=8890",
+        [sys.executable, str(server_dir / "server.py"), "--host=127.0.0.1", "--port=8890",
          "--enable_venv=False", "--check_update=False"],
-        cwd=ROOT / "server", env=env,
+        cwd=server_dir, env=env,
     )
 
 
