@@ -23,6 +23,7 @@ from utils.cropper import Cropper
 from utils.auto_outline import attach_outlines
 from utils.inline_fractions import finalize_inline_fonts, prepare_inline_fractions
 from utils.page_overlay import repair_translation_outputs
+from utils.vector_figures import prepare_vector_figures, restore_vector_figures
 import traceback
 import argparse
 import sys  # 用于退出脚本
@@ -1144,10 +1145,12 @@ class PDFTranslator:
 
     def translate_pdf_next(self, input_path, config, task_id=None):
         # 临时输入保留原文件名；恢复数学字体后再裁切、补大纲或交给 Zotero。
-        with prepare_inline_fractions(input_path, config.skip_last_pages) as (prepared, maps):
-            outputs = self._run_pdf2zh_next(prepared, config, task_id)
-            if prepared != input_path:
-                finalize_inline_fonts(outputs, maps)
+        with prepare_vector_figures(input_path, config.skip_last_pages) as (art_input, figures):
+            with prepare_inline_fractions(art_input, config.skip_last_pages) as (prepared, maps):
+                outputs = self._run_pdf2zh_next(prepared, config, task_id)
+                if prepared != art_input:
+                    finalize_inline_fonts(outputs, maps)
+            restore_vector_figures(input_path, outputs, figures)
         repair_translation_outputs(input_path, outputs)
         return outputs
 
