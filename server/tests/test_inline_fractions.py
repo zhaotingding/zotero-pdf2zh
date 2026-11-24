@@ -14,7 +14,9 @@ from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 from utils.inline_fractions import prepare_inline_fractions, restore_commas
 
 
-def write_fixture(path, with_prose=True, with_commas=True):
+def write_fixture(
+    path, with_prose=True, with_commas=True, math_face="/CMMI5", absolute_bar=False
+):
     writer = PdfWriter()
     cmap = DecodedStreamObject()
     cmap.set_data(b"""begincmap
@@ -37,7 +39,7 @@ endcmap""")
             }
         )
 
-    math = font("/CMMI5")
+    math = font(math_face)
     math[NameObject("/ToUnicode")] = writer._add_object(cmap)
     fonts = DictionaryObject(
         {
@@ -65,6 +67,12 @@ BT /M 5 Tf 1 0 0 1 45 140 Tm (,p) Tj ET
         )
         if not with_commas:
             stream.set_data(stream.get_data().replace(b"(,p)", b"(ap)", 2))
+        if absolute_bar:
+            stream.set_data(
+                stream.get_data().replace(
+                    b"q 1 0 0 1 80 200 cm 0 0 m 45 0 l S Q", b"80 200 m 125 200 l S"
+                )
+            )
         page[NameObject("/Contents")] = writer._add_object(stream)
     writer.add_outline_item(title="Section", page_number=0)
     writer.write(path)
@@ -140,6 +148,23 @@ class InlineFractionTests(unittest.TestCase):
                 self.assertEqual(
                     doc[0].get_pixmap().digest, source[0].get_pixmap().digest
                 )
+
+    def test_other_font_and_absolute_rule_restore_subscript_commas(self):
+        write_fixture(self.source, math_face="/Helvetica", absolute_bar=True)
+        with prepare_inline_fractions(str(self.source)) as (prepared, maps):
+            self.assertTrue(maps)
+            with pdf.open(prepared) as work, pdf.open(self.source) as original:
+                self.assertEqual(work[0].get_text().count("\ue000"), 2)
+                self.assertEqual(
+                    work[0].get_pixmap().digest, original[0].get_pixmap().digest
+                )
+                self.assertEqual(
+                    [draw["type"] for draw in work[0].get_drawings()], ["f", "s"]
+                )
+                text = original[0].get_text()
+            restore_commas([prepared], maps)
+            with pdf.open(prepared) as work:
+                self.assertEqual(work[0].get_text(), text)
 
     def test_server_restores_text_before_downstream_repairs(self):
         from server import PDFTranslator

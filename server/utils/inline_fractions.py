@@ -22,6 +22,12 @@ from utils.inline_accents import (
     restore_glyph_metrics,
     same_appearance,
 )
+from utils.inline_math import (
+    apply_paint_edits,
+    inline_slots,
+    protect_form_runs,
+    protect_inline_runs,
+)
 
 MATH = re.compile(r"(?:(?:CMMI|CMSY|CMEX|CMR|CMBX)\d+|MTMI)\Z")
 ITALIC = re.compile(r"CMMI\d+\Z")
@@ -48,9 +54,7 @@ BFCHAR = re.compile(rb"(?s)\bbeginbfchar\b(.*?)\bendbfchar\b")
 
 def inline_geometry(page):
     """Find printed fractions and superimposed TeX accents next to running prose."""
-    if page.rotation or not any(
-        MATH.fullmatch(f[3].split("+")[-1]) for f in page.get_fonts()
-    ):
+    if page.rotation:
         return [], []
     math_chars, prose, pairs = [], [], []
     previous = None
@@ -85,9 +89,17 @@ def inline_geometry(page):
                 previous = glyph
             continue
         previous = None
-        if re.search(
-            r"[A-Za-z]{2,}", "".join(chr(c[0]) for c in span["chars"] if c[0] >= 0)
-        ):
+        text = "".join(chr(c[0]) for c in span["chars"] if 0 <= c[0] <= 0x10FFFF)
+        if not re.search(r"[A-Za-z]{3,}", text):
+            # 来自混排字体的小号分子、分母仍可由上下位置与分数线识别。
+            math_chars.extend(
+                Glyph(
+                    chr(c[0]), name, c[2], span["size"], pdf.Rect(c[3]), span["color"]
+                )
+                for c in span["chars"]
+                if 0 <= c[0] <= 0x10FFFF and not chr(c[0]).isspace()
+            )
+        if re.search(r"[A-Za-z]{2,}", text):
             prose.extend(
                 (pdf.Rect(c[3]), span["size"])
                 for c in span["chars"]
@@ -160,10 +172,16 @@ def matching_operators(ops, fonts, matrix, rules, accents):
     line = None
     at_start = False
     bars, shows = {}, {}
+    open_path = False
     anchors = {c for _, _, _, commas in rules for c in commas}
     anchors.update(g.anchor for pair in accents for g in pair)
     for i, (args, op) in enumerate(ops):
         ctm, font, size = state
+        fresh_path = not open_path
+        if op in (b"m", b"l", b"h", b"re", b"c", b"v", b"y"):
+            open_path = True
+        elif op in (b"S", b"s", b"f", b"F", b"f*", b"B", b"B*", b"b", b"b*", b"n"):
+            open_path = False
         if op == b"q":
             stack.append(state)
         elif op == b"Q" and stack:
@@ -205,10 +223,9 @@ def matching_operators(ops, fonts, matrix, rules, accents):
                                 else (i, font, size, parts[0][0])
                             )
             at_start = False
-        elif op == b"m" and i >= 2 and i + 3 < len(ops):
+        elif op == b"m" and fresh_path and i + 2 < len(ops):
             if (
-                [o for _, o in ops[i - 2 : i]] != [b"q", b"cm"]
-                or [o for _, o in ops[i + 1 : i + 4]] != [b"l", b"S", b"Q"]
+                [o for _, o in ops[i + 1 : i + 3]] != [b"l", b"S"]
                 or ctm.a <= 0
                 or ctm.d <= 0
                 or ctm.b
@@ -226,9 +243,11 @@ def matching_operators(ops, fonts, matrix, rules, accents):
                     bars[j] = (
                         i,
                         [
+                            ([], b"q"),
                             ([FloatObject(v) for v in color], b"rg"),
                             ([FloatObject(v) for v in rect], b"re"),
                             ([], b"f"),
+                            ([], b"Q"),
                         ],
                     )
     return bars, shows
@@ -254,11 +273,15 @@ def protected_cmap(font, code):
     )
 
 
-def rewrite_page(page, writer, matrix, rules, accents, originals):
+def rewrite_page(page, writer, matrix, rules, accents, slots, originals):
     content = ContentStream(page["/Contents"], writer, forced_encoding="bytes")
     ops = content.operations
     resources = DictionaryObject(page["/Resources"].get_object())
-    fonts = DictionaryObject(resources["/Font"].get_object())
+    fonts = (
+        DictionaryObject(resources["/Font"])
+        if "/Font" in resources
+        else DictionaryObject()
+    )
     bars, shows = matching_operators(ops, fonts, matrix, rules, accents)
     edits, aliases = {}, {}
     for j, (_, _, _, commas) in enumerate(rules):
@@ -292,17 +315,16 @@ def rewrite_page(page, writer, matrix, rules, accents, originals):
         i, replacement = bars[j]
         edits[i] = (3, replacement)
     protect_accents(writer, fonts, ops, shows, accents, edits)
-    if not edits:
+    protect_inline_runs(writer, fonts, ops, slots, edits, originals)
+    nested = protect_form_runs(writer, resources, ops, slots, originals)
+    if not edits and not nested:
         return False
-    for i in sorted(edits, reverse=True):
-        n, replacements = edits[i]
-        ops[i : i + n] = replacements
-    content.operations = ops
-    data = DecodedStreamObject()
-    data.set_data(content.get_data())
-    resources[NameObject("/Font")] = fonts
+    if edits:
+        data = DecodedStreamObject()
+        data.set_data(apply_paint_edits(content, edits))
+        page[NameObject("/Contents")] = writer._add_object(data)
+        resources[NameObject("/Font")] = fonts
     page[NameObject("/Resources")] = resources
-    page[NameObject("/Contents")] = writer._add_object(data)
     return True
 
 
@@ -313,8 +335,10 @@ def _write_pages(original, prepared, plans):
         PdfReader(original) as reader,
         closing(PdfWriter(reader, incremental=True)) as writer,
     ):
-        for i, matrix, rules, accents in plans:
-            if rewrite_page(writer.pages[i], writer, matrix, rules, accents, maps):
+        for i, matrix, rules, accents, slots in plans:
+            if rewrite_page(
+                writer.pages[i], writer, matrix, rules, accents, slots, maps
+            ):
                 changed[i] = accents
         if changed:
             writer.write(prepared)
@@ -328,8 +352,9 @@ def _prepare(path, skip_last, stack):
         for i in range(max(0, len(doc) - skip_last)):
             page = doc[i]
             rules, accents = inline_geometry(page)
-            if rules or accents:
-                plans.append((i, page.transformation_matrix, rules, accents))
+            slots = inline_slots(page, [bar for bar, _, _, _ in rules])
+            if rules or accents or slots:
+                plans.append((i, page.transformation_matrix, rules, accents, slots))
     if not plans:
         return path, {}
     prepared = (
@@ -393,7 +418,7 @@ def finalize_inline_fonts(paths, originals):
                         if restore_glyph_metrics(doc, font[0]):
                             changed = True
                         continue
-                    if not ITALIC.fullmatch(font[3].split("+")[-1]):
+                    if not originals:
                         continue
                     kind, value = doc.xref_get_key(font[0], "ToUnicode")
                     if kind != "xref":
@@ -407,12 +432,11 @@ def finalize_inline_fonts(paths, originals):
                     if before is not None:
                         doc.update_stream(ref, before)
                         changed = True
-                    elif (
-                        font[4],
-                        font[3],
-                    ) in originals and b"<FE50>" in actual.upper():
+                    elif b"/CMapName /PDF2zhInline" in actual or (
+                        (font[4], font[3]) in originals and b"<FE50>" in actual.upper()
+                    ):
                         raise ValueError(
-                            "输出的数学字体字符映射发生变化，无法确认下标逗号"
+                            "输出的数学字体字符映射发生变化，无法还原行内公式文字"
                         )
             if changed:
                 doc.saveIncr()
