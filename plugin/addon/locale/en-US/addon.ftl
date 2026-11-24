@@ -9,6 +9,10 @@ prefs-menu-crop-compare = Bilingual PDF(After Cropping)
 prefs-menu-compare = Bilingual PDF
 
 operation-progress-title = PDF2zh
+local-service-waiting = Connecting to the local translation service and starting it if needed…
+local-service-wrong = Port 8890 did not return a healthy PDF2zh service. Check the service using this port.
+local-service-missing = The desktop shortcut “Zotero PDF2zh 翻译服务.lnk” was not found. Check the shortcut or server address.
+local-service-timeout = The shortcut was launched, but the service was not ready within 90 seconds. Check the service window and try again.
 operation-progress-processing = Preparing request...
 operation-progress-submitting = Submitting “{ $fileName }”...
 operation-progress-accepted = Submitted. { $action } “{ $fileName }” now

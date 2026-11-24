@@ -2,6 +2,7 @@ import { getPref } from "../utils/prefs";
 import { getString } from "../utils/locale";
 import { version as pluginVersion } from "../../package.json";
 import { FileProcessor } from "./pdf2zhFileProcessor";
+import { ensureTranslationService } from "./pdf2zhLocalService";
 import {
     isPDFPath,
     taskFinishedWithoutFiles,
@@ -82,6 +83,19 @@ export class PDF2zhHelperFactory {
             tasks.map((task) => task.fileName),
         );
         const fileProcessor = FileProcessor.getInstance();
+        if (endpoint === "translate") {
+            try {
+                await ensureTranslationService(
+                    tasks[0].config.serverUrl,
+                    () => progress.waitForService(),
+                    getString,
+                );
+            } catch (error) {
+                progress.complete(0, tasks.length);
+                ztoolkit.getGlobal("alert")(String(error));
+                return;
+            }
+        }
         try {
             const result = await fileProcessor.processBatch(tasks, (update) => {
                 progress.updateFile(update);
@@ -1263,6 +1277,14 @@ class JobProgressPopup {
         } catch (error) {
             ztoolkit.log("更新进度窗口失败:", error);
         }
+    }
+
+    waitForService() {
+        this.changeLine(this.summaryIdx, {
+            text: getString("local-service-waiting"),
+            progress: 0,
+            type: "default",
+        });
     }
 
     updateFile(update: JobProgressUpdate) {

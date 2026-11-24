@@ -9,6 +9,10 @@ prefs-menu-compare = 双语对照
 prefs-menu-crop-compare = 双语对照(裁剪后拼接)
 
 operation-progress-title = PDF2zh
+local-service-waiting = 正在连接本机翻译服务，服务未运行时将自动启动…
+local-service-wrong = 本机 8890 端口未返回 PDF2zh 健康状态，请检查占用该端口的服务。
+local-service-missing = 找不到桌面快捷方式「Zotero PDF2zh 翻译服务.lnk」，请检查快捷方式或服务地址。
+local-service-timeout = 已启动桌面快捷方式，但 90 秒内服务仍未就绪。请查看翻译服务窗口中的提示，然后重试。
 operation-progress-processing = 正在准备请求...
 operation-progress-submitting = 正在提交「{ $fileName }」...
 operation-progress-accepted = 已提交，正在{ $action }「{ $fileName }」
