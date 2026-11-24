@@ -408,13 +408,13 @@ def finalize_inline_fonts(paths, originals):
         with pdf.open(path) as doc:
             changed = False
             seen = set()
+            fonts_seen = set()
             for page in doc:
                 for font in page.get_fonts(full=True):
-                    if (
-                        font[2:4] == ("Type3", "CMMIInlineAccent")
-                        and font[0] not in seen
-                    ):
-                        seen.add(font[0])
+                    if font[0] in fonts_seen:
+                        continue
+                    fonts_seen.add(font[0])
+                    if font[2:4] == ("Type3", "CMMIInlineAccent"):
                         if restore_glyph_metrics(doc, font[0]):
                             changed = True
                         continue
@@ -426,9 +426,17 @@ def finalize_inline_fonts(paths, originals):
                     ref = int(value.split()[0])
                     if ref in seen:
                         continue
-                    seen.add(ref)
                     actual = doc.xref_stream(ref)
                     before = by_content.get(actual)
+                    if before is not None and b"/CMapName /PDF2zhInlineCore" in actual:
+                        # 一个 CMap 可能被多个资源共用。逐个恢复原标准字体（含编码），保留各自的绘制坐标。
+                        kind, source = doc.xref_get_key(font[0], "PDF2zhCoreSource")
+                        if kind != "xref":
+                            raise ValueError("无法确认受保护的标准字体来源")
+                        doc.xref_copy(int(source.split()[0]), font[0])
+                        changed = True
+                        continue
+                    seen.add(ref)
                     if before is not None:
                         doc.update_stream(ref, before)
                         changed = True

@@ -4,10 +4,158 @@ from tempfile import TemporaryDirectory
 
 import pymupdf as pdf
 from utils.inline_fractions import finalize_inline_fonts, prepare_inline_fractions
-from utils.inline_math import _codes
+from utils.inline_math import _codes, math_ranges
 
 
 class InlineMathTests(unittest.TestCase):
+    def test_native_parser_preserves_standard_font_advances_after_marking(self):
+        # The PDF viewer can render a standard font correctly even when the translation
+        # engine has collapsed all of its protected character advances to zero.
+        try:
+            from babeldoc.rust_parser_service import parse_pdf_to_il
+        except ImportError:
+            self.skipTest("BabelDOC parser is in a separate translation environment")
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp, "core-widths.pdf")
+            with pdf.open() as doc:
+                page = doc.new_page()
+                for i, name in enumerate(("helv", "tiro", "cobo")):
+                    page.insert_text(
+                        (40, 60 + 25 * i),
+                        "The result is F(a) = x = 0.25 today.",
+                        fontname=name,
+                    )
+                doc.save(path)
+            before = parse_pdf_to_il(path).page[0].pdf_character
+            with prepare_inline_fractions(str(path)) as (prepared, maps):
+                self.assertTrue(maps)
+                after = parse_pdf_to_il(prepared).page[0].pdf_character
+                self.assertGreater(sum(c.char_unicode == "\ue000" for c in after), 15)
+                for a, b in zip(before, after, strict=True):
+                    self.assertEqual(a.pdf_character_id, b.pdf_character_id)
+                    self.assertAlmostEqual(a.advance, b.advance, places=3)
+                    self.assertAlmostEqual(a.box.x, b.box.x, places=3)
+                finalize_inline_fonts([prepared], maps)
+                with pdf.open(path) as source, pdf.open(prepared) as output:
+                    self.assertEqual(source[0].get_text(), output[0].get_text())
+                    self.assertEqual(
+                        source[0].get_pixmap().digest, output[0].get_pixmap().digest
+                    )
+
+    def test_recognizes_decorated_and_radical_operands_without_changing_literals(self):
+        for expression in (
+            "Enc(u) = ˆy",
+            "√(a+b) = y",
+            "z = √(a+b)",
+            "3.25 <= q ≈ f(i)",
+        ):
+            with self.subTest(expression=expression):
+                text = (
+                    "We obtain " + expression + " in this case; mode=fast is a setting."
+                )
+                ranges = [
+                    text[start:end]
+                    for kind, start, end in math_ranges(text)
+                    if kind == "relation"
+                ]
+                self.assertEqual(ranges, [expression])
+
+    def test_relations_join_balanced_operands_arithmetic_and_chains(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp, "relations.pdf")
+            cases = ("F(k) + 0.25 = q = (u - v)", "(a+b) <= G(c)", "w = -2.75")
+            with pdf.open() as doc:
+                page = doc.new_page()
+                for i, expr in enumerate(cases):
+                    page.insert_text(
+                        (40, 60 + i * 24),
+                        "Compare " + expr + " in the paper.",
+                        fontsize=10,
+                    )
+                page.insert_text(
+                    (40, 150), "The setting mode=fast and the label (A) remain text."
+                )
+                doc.save(path)
+            with prepare_inline_fractions(str(path)) as (prepared, maps):
+                self.assertTrue(maps)
+                with pdf.open(prepared) as marked, pdf.open(path) as source:
+                    lines = marked[0].get_text().splitlines()
+                    for line in lines[: len(cases)]:
+                        math = line.removeprefix("Compare ").removesuffix(
+                            " in the paper."
+                        )
+                        self.assertEqual(set(math.replace(" ", "")), {"\ue000"}, line)
+                    self.assertIn("mode=fast", lines[-1])
+                    self.assertIn("(A)", lines[-1])
+                    self.assertEqual(
+                        source[0].get_pixmap().digest, marked[0].get_pixmap().digest
+                    )
+                finalize_inline_fonts([prepared], maps)
+                with pdf.open(prepared) as restored, pdf.open(path) as original:
+                    self.assertEqual(restored[0].get_text(), original[0].get_text())
+
+    def test_equation_keeps_original_glyphs_with_scripts_in_either_order(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp, "equations.pdf")
+            with pdf.open() as doc:
+                page = doc.new_page()
+                page.insert_font(fontname="Math", fontbuffer=pdf.Font("tiro").buffer)
+                for y, upper_first in [(60, True), (90, False)]:
+                    page.insert_text((22, y), "Given", fontsize=10)
+                    page.insert_text((57, y), "v", fontsize=10, fontname="tiit")
+                    scripts = [("′", -6.2, 5.5), ("j", 2.7, 7.3)]
+                    if not upper_first:
+                        scripts.reverse()
+                    for char, shift, size in scripts:
+                        page.insert_text(
+                            (62, y + shift), char, fontsize=size, fontname="Math"
+                        )
+                    page.insert_text(
+                        (68, y),
+                        "=" if upper_first else "≤",
+                        fontsize=10,
+                        fontname="Math",
+                    )
+                    page.insert_text((77, y), "F", fontsize=10)
+                    page.insert_text((83.5, y + 2), "k", fontsize=7)
+                    page.insert_text((88, y), "(u)", fontsize=10)
+                    page.insert_text((109, y), "in this case.", fontsize=10)
+                    page.insert_text((160, y), "q", fontname="tiit", fontsize=10)
+                    for char, shift, size in scripts:
+                        page.insert_text(
+                            (165.6, y + shift), char, fontsize=size, fontname="Math"
+                        )
+                    page.insert_text((172, y), "ends here.", fontsize=10)
+                page.insert_text((30, 125), "The literal setting mode=fast is text.")
+                doc.save(path)
+            with prepare_inline_fractions(str(path)) as (prepared, maps):
+                with pdf.open(prepared) as marked, pdf.open(path) as original:
+
+                    def glyphs(page):
+                        return [
+                            (c[0], c[2])
+                            for s in page.get_texttrace()
+                            for c in s["chars"]
+                        ]
+
+                    for (before, pos), (after, _) in zip(
+                        glyphs(original[0]), glyphs(marked[0]), strict=True
+                    ):
+                        if chr(before) == " ":
+                            continue
+                        is_math = (56 <= pos[0] < 107 or 160 <= pos[0] < 170) and pos[
+                            1
+                        ] < 100
+                        self.assertEqual(
+                            after, 0xE000 if is_math else before, (chr(before), pos)
+                        )
+                    self.assertEqual(
+                        marked[0].get_pixmap().digest, original[0].get_pixmap().digest
+                    )
+                finalize_inline_fonts([prepared], maps)
+                with pdf.open(prepared) as restored, pdf.open(path) as original:
+                    self.assertEqual(glyphs(restored[0]), glyphs(original[0]))
+
     def test_variable_with_multiletter_subscript_or_exponent_remains_one_math_run(self):
         with TemporaryDirectory() as tmp:
             path = Path(tmp, "variables.pdf")
