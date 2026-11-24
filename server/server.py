@@ -21,6 +21,7 @@ from utils.config_map import pdf2zh_next_service_aliases
 from utils.config_migration import prepare_config_files
 from utils.cropper import Cropper
 from utils.auto_outline import attach_outlines
+from utils.inline_fractions import prepare_inline_fractions, restore_commas
 from utils.page_overlay import repair_translation_outputs
 import traceback
 import argparse
@@ -1082,6 +1083,14 @@ class PDFTranslator:
         return existing
 
     def translate_pdf_next(self, input_path, config, task_id=None):
+        # 临时输入保留原文件名；还原公式字符后再裁切、补大纲或交给 Zotero。
+        with prepare_inline_fractions(input_path, config.skip_last_pages) as (prepared, maps):
+            outputs = self._run_pdf2zh_next(prepared, config, task_id)
+            restore_commas(outputs, maps)
+        repair_translation_outputs(input_path, outputs)
+        return outputs
+
+    def _run_pdf2zh_next(self, input_path, config, task_id=None):
         if config.service in pdf2zh_next_service_aliases:
             config.service = pdf2zh_next_service_aliases[config.service]
         config.update_config_file(config_path[pdf2zh_next])
@@ -1245,7 +1254,6 @@ class PDFTranslator:
         if not existing:
             raise RuntimeError("操作失败，请查看详细日志。")
 
-        repair_translation_outputs(input_path, existing)
         return existing
 
     def run(self, host, port, debug=False):
