@@ -1353,6 +1353,9 @@ def str2bool(v):
         raise argparse.ArgumentTypeError('Boolean value expected.')
 
 if __name__ == '__main__':
+    if sys.platform == "win32" and os.environ.get("ZOTERO_PDF2ZH_DATA_DIR"):
+        import ctypes
+        ctypes.windll.kernel32.SetConsoleTitleW("Zotero PDF2zh 翻译服务")
     parser = argparse.ArgumentParser()
     parser.add_argument('--host', type=str, default='127.0.0.1', help='Server bind host; use 0.0.0.0 only when remote access is intentionally required')
     parser.add_argument('--port', type=int, default=PORT, help='Port to run the server on')

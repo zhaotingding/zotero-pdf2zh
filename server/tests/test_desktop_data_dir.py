@@ -9,6 +9,40 @@ from unittest.mock import patch
 
 
 class DesktopDataDirectoryTest(unittest.TestCase):
+    @unittest.skipUnless(os.name == "nt", "Windows desktop launcher")
+    def test_launcher_creates_one_visible_service_console_only_on_cold_start(self):
+        import subprocess
+        import sys
+        from unittest.mock import Mock
+
+        entry = Path(__file__).resolve().parents[2] / "start_service.py"
+        main = runpy.run_path(str(entry))["main"]
+        need_key = Mock(return_value="offline-test")
+        with (
+            patch.dict(main.__globals__, {"Tk": Mock(), "api_key": need_key}),
+            patch("socket.socket") as probe,
+            patch("subprocess.check_output", return_value="test-revision"),
+            patch("subprocess.Popen") as launch,
+            patch("tkinter.messagebox.showinfo"),
+            patch.object(sys, "argv", [str(entry)]),
+        ):
+            check = probe.return_value.__enter__.return_value.connect_ex
+            check.return_value = 10061
+            self.assertEqual(main(), 0)
+            command = launch.call_args.args[0]
+            options = launch.call_args.kwargs
+            self.assertEqual(Path(command[0]).name, "python.exe")
+            self.assertEqual(Path(command[1]), entry.parent / "server" / "server.py")
+            self.assertEqual(options["creationflags"], subprocess.CREATE_NEW_CONSOLE)
+            self.assertTrue(
+                options["startupinfo"].dwFlags & subprocess.STARTF_USESHOWWINDOW
+            )
+            self.assertEqual(options["startupinfo"].wShowWindow, 1)
+            check.return_value = 0
+            main()
+            launch.assert_called_once()
+            need_key.assert_called_once()
+
     def test_checkout_serves_existing_files_and_migrates_from_its_own_templates(self):
         entry = Path(__file__).resolve().parents[1] / "server.py"
         with (

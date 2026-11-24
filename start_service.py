@@ -92,11 +92,17 @@ def main():
         "PDF2ZH_OPENAI_BASE_URL": "https://api.openai.com/v1",
         "PDF2ZH_OPENAI_SEND_TEMPRATURE": "false",
     })
-    return subprocess.call(
-        [sys.executable, str(server_dir / "server.py"), "--host=127.0.0.1", "--port=8890",
+    # 日志窗口属于服务进程，不继承 Zotero 或开发终端的隐藏控制台。
+    # 下次翻译通过 /health 复用同一服务，启动程序可以立即退出。
+    info = subprocess.STARTUPINFO()
+    info.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    info.wShowWindow = 1  # SW_SHOWNORMAL
+    subprocess.Popen(
+        [str(prefix / "python.exe"), str(server_dir / "server.py"), "--host=127.0.0.1", "--port=8890",
          "--enable_venv=False", "--check_update=False"],
-        cwd=server_dir, env=env,
+        cwd=server_dir, env=env, creationflags=subprocess.CREATE_NEW_CONSOLE, startupinfo=info,
     )
+    return 0
 
 
 if __name__ == "__main__":
