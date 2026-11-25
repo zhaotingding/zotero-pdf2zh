@@ -3,13 +3,16 @@
 import hashlib
 import math
 import re
+from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
+from itertools import pairwise
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import pymupdf as pdf
 from pypdf import PdfReader
+from utils.compound_math import is_math_text
 from utils.page_overlay import figure_boxes
 
 CAPTION = re.compile(
@@ -93,6 +96,70 @@ def _lines(page):
     ]
 
 
+def _math_table_rows(page, captions, draws):
+    # Repeated, coextensive rules identify rows. Only freeze data consisting
+    # of mathematical expressions and terse identifiers. Headings and prose
+    # still go through translation, including mixed tables on the same page.
+    rules = defaultdict(list)
+    for draw in draws:
+        rect = draw["rect"]
+        if (
+            len(draw["items"]) == 1
+            and rect.height < 1
+            and rect.width > page.rect.width * 0.23
+        ):
+            rules[round(rect.x0), round(rect.x1)].append((rect.y0 + rect.y1) / 2)
+    spans = page.get_texttrace()
+    for (left, right), lines in rules.items():
+        ys = sorted({round(y, 2) for y in lines})
+        if len(ys) < 3:
+            continue
+        for cap in captions:
+            if not left < (cap.x0 + cap.x1) / 2 < right:
+                continue
+            # Start at the ruled edge next to this caption; do not connect
+            # distant tables sharing identical column widths.
+            edge = min(
+                range(len(ys)),
+                key=lambda i: min(abs(ys[i] - cap.y0), abs(ys[i] - cap.y1)),
+            )
+            if min(abs(ys[edge] - cap.y0), abs(ys[edge] - cap.y1)) > 28:
+                continue
+            step = -1 if ys[edge] < cap.y0 else 1
+            limit = edge
+            while (
+                0 <= limit + step < len(ys)
+                and 3 < abs(ys[limit + step] - ys[limit]) < 55
+            ):
+                limit += step
+            start = None
+            nearby = ys[min(edge, limit) : max(edge, limit) + 1]
+            for top, bottom in pairwise(nearby):
+                math_count = 0
+                prose = False
+                for span in spans:
+                    chars = "".join(
+                        chr(c[0]) if 0 <= c[0] <= 0x10FFFF else "\ufffd"
+                        for c in span["chars"]
+                        if left <= c[2][0] <= right and top < c[2][1] < bottom
+                    )
+                    if is_math_text(span["font"], chars):
+                        math_count += len(chars)
+                    elif re.search(r"[a-z]{2,}|[A-Z]{6,}|[\u3400-\u9fff\ufffd]", chars):
+                        prose = True
+                if math_count >= 10 and not prose:
+                    start = top if start is None else start
+                elif start is not None:
+                    yield pdf.Rect(
+                        left - 1, math.floor(start), right + 1, math.ceil(top)
+                    )
+                    start = None
+            if start is not None:
+                yield pdf.Rect(
+                    left - 1, math.floor(start), right + 1, math.ceil(nearby[-1] + 0.5)
+                )
+
+
 def find_figures(path, skip_last=0):
     found = []
     with pdf.open(path) as doc, PdfReader(path) as structure:
@@ -110,9 +177,20 @@ def find_figures(path, skip_last=0):
                 for box, text in blocks
                 if (m := CAPTION.match(text))
             ]
-            if not any(label not in ("table", "表") for _, label in captions):
+            if not captions:
                 continue
             draws = page.get_drawings()
+            table_captions = [
+                box for box, label in captions if label in ("table", "表")
+            ]
+            if table_captions:
+                regions = _math_table_rows(page, table_captions, draws)
+                found.extend(
+                    Figure(index, box)
+                    for box in {tuple(r): r for r in regions}.values()
+                )
+            if len(table_captions) == len(captions):
+                continue
             images = [pdf.Rect(im["bbox"]) for im in page.get_image_info()]
             if (
                 len(draws) < 8 or not any(_complex_path(draw) for draw in draws)

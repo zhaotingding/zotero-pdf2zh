@@ -21,8 +21,8 @@ ACCENTS = {"ˆ": "\u0302", "^": "\u0302", "˜": "\u0303", "¯": "\u0304", "˙": 
 _METRICS_AFTER_SAVE = re.compile(rb"^\s*(q\s+)((?:[-+.\d]+\s+){6}d1)\b")
 
 
-def restore_glyph_metrics(doc, font_ref):
-    kind, ref = doc.xref_get_key(font_ref, "CharProcs/accent")
+def restore_glyph_metrics(doc, font_ref, procedure="accent"):
+    kind, ref = doc.xref_get_key(font_ref, "CharProcs/" + procedure)
     if kind != "xref":
         return False
     glyph = int(ref.split()[0])

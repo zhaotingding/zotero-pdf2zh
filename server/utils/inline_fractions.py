@@ -16,6 +16,7 @@ from pypdf.generic import (
     FloatObject,
     NameObject,
 )
+from utils.compound_math import restore_compound
 from utils.inline_accents import (
     ACCENTS,
     protect_accents,
@@ -418,6 +419,8 @@ def finalize_inline_fonts(paths, originals):
                         if restore_glyph_metrics(doc, font[0]):
                             changed = True
                         continue
+                    if font[2:4] == ("Type3", "CMMICompound"):
+                        changed |= restore_compound(doc, font[0])
                     if not originals:
                         continue
                     kind, value = doc.xref_get_key(font[0], "ToUnicode")
