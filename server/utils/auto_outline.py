@@ -398,3 +398,64 @@ def attach_outlines(source, paths, config, server, engine):
                 )
             finally:
                 Path(tmp).unlink(missing_ok=True)
+
+
+def add_review_bookmarks(paths, reviews, config, server):
+    """Keep ambiguous physical source page numbers accessible in Zotero's PDF outline."""
+    translated = int(not (config.trans_first or config.enhance_compatibility))
+    for path in paths:
+        kind = server.get_filetype(path)
+        if kind == "dual":
+            kind = server.get_dual_mode(path, config.dual_mode)
+        layout = "mono" if kind in ("mono", "mono-cut") else config.dual_mode
+        notes = reviews.get(layout, {})
+        if not notes:
+            continue
+        with pdf.open(path) as doc:
+            rows = []
+            for n, kinds in sorted(notes.items()):
+                idx = int(n) - 1
+                factor = {"TB": 2, "mono-cut": 2, "dual-cut": 4, "crop-compare": 2}.get(
+                    kind, 1
+                )
+                page = idx * factor + (translated if kind in ("TB", "dual-cut") else 0)
+                if not 0 <= page < len(doc):
+                    continue
+                x = (
+                    doc[page].rect.width * translated / 2
+                    if kind in ("LR", "compare", "crop-compare")
+                    else 0
+                )
+                dest = {
+                    "kind": pdf.LINK_GOTO,
+                    "page": page,
+                    "to": pdf.Point(x, 0),
+                    "zoom": 0,
+                }
+                rows.append([2, f"原文第 {n} 页 · {'、'.join(kinds)}", page + 1, dest])
+            if not rows:
+                continue
+            title = "PDF2zh · 排版待核对"
+            toc = doc.get_toc(False)
+            start = next(
+                (i for i, row in enumerate(toc) if row[:2] == [1, title]), len(toc)
+            )
+            if start < len(toc) and all(
+                r[0] == 2 and r[1].startswith("原文第 ") for r in toc[start + 1 :]
+            ):
+                toc = toc[:start]
+            updated = [*toc, [1, title, *rows[0][2:]], *rows]
+            if [r[:3] for r in updated] == doc.get_toc():
+                continue
+        # 书签仅是告知渠道。写入失败时保留已验证的 PDF 和任务结果中的页码。
+        path = Path(path)
+        with tempfile.TemporaryDirectory(prefix=".review-", dir=path.parent) as folder:
+            staged = Path(folder) / path.name
+            shutil.copyfile(path, staged)
+            with pdf.open(staged) as result:
+                result.set_toc(updated, collapse=1)
+                result.saveIncr()
+            with pdf.open(staged) as result:
+                if result.get_toc() != [r[:3] for r in updated]:
+                    raise ValueError("待核对书签回读不一致")
+            os.replace(staged, path)

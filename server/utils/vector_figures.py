@@ -10,9 +10,10 @@ from itertools import pairwise
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+import numpy as np
 import pymupdf as pdf
 from pypdf import PdfReader
-from utils.compound_math import is_math_text
+from utils.compound_math import is_math_face, is_math_text, math_words_only
 from utils.page_overlay import figure_boxes
 
 CAPTION = re.compile(
@@ -160,6 +161,112 @@ def _math_table_rows(page, captions, draws):
                 )
 
 
+def _display_math_regions(page, draws):
+    # 长推导中多层乘积、求和与分式共用数行。以正文为边界保留独立的原版推导，
+    # 避免引擎把各行压成一个段落。含说明、表格或插图的区域走各自的处理流程。
+    if not any("CMEX" in f[3] or "Math" in f[3] for f in page.get_fonts()):
+        return []
+    blocks = page.get_text(
+        "dict", flags=pdf.TEXTFLAGS_DICT & ~pdf.TEXT_PRESERVE_IMAGES
+    )["blocks"]
+    spans = [
+        s
+        for b in blocks
+        for line in b.get("lines", ())
+        for s in line["spans"]
+        if s["text"].strip()
+    ]
+    barriers = []
+    for s in spans:
+        if re.search(r"[\u3400-\u9fff]", s["text"]) or (
+            re.search(r"[A-Za-z]{2,}", s["text"])
+            and not is_math_text(s["font"], s["text"])
+            and not math_words_only(s["text"])
+        ):
+            barriers.append((s["bbox"][1], s["bbox"][3]))
+    if not barriers:
+        return []
+    intervals = []
+    for a, b in sorted(barriers):
+        if intervals and a <= intervals[-1][1]:
+            intervals[-1] = (intervals[-1][0], max(b, intervals[-1][1]))
+        else:
+            intervals.append((a, b))
+    gaps = zip(
+        [0, *[b for _, b in intervals]], [*[a for a, _ in intervals], page.rect.height]
+    )
+    result = []
+    for y0, y1 in gaps:
+        if y1 - y0 < 40:
+            continue
+        band = [s for s in spans if y0 < s["origin"][1] < y1]
+        # Require large operators on multiple lines, not a lone tall radical.
+        large = sorted(
+            s["origin"][1]
+            for s in band
+            if "CMEX" in s["font"] or re.search(r"[∑∏∫]", s["text"])
+        )
+        if len(large) < 3 or large[-1] - large[0] < 22:
+            continue
+        if sum(len(s["text"].strip()) for s in band if is_math_face(s["font"])) < 45:
+            continue
+        rect = pdf.Rect()
+        for s in band:
+            rect |= pdf.Rect(s["bbox"])
+        if rect.height < 40 or rect.width < 40:
+            continue
+        if any(pdf.Rect(im["bbox"]).intersects(rect) for im in page.get_image_info()):
+            continue
+        if any(
+            ((d["rect"].width < 1 and d["rect"].height > 5) or _complex_path(d))
+            and rect.intersects(d["rect"] + (-0.5, -0.5, 0.5, 0.5))
+            for d in draws
+        ):
+            continue
+        rect = (
+            pdf.Rect(
+                math.floor(rect.x0 - 1.5),
+                max(math.ceil(y0), math.floor(rect.y0 - 2)),
+                math.ceil(rect.x1 + 1.5),
+                min(math.floor(y1), math.ceil(rect.y1 + 2)),
+            )
+            & page.rect
+        )
+        if not rect.is_empty:
+            result.append(rect)
+    if not result:
+        return []
+    # 正文里的行内分式可能高出本行文字框。沿整页真实留白切分，不能将下一句
+    # 的分子或上标裁进上一块推导；找不到清楚边界时沿用原翻译流程。
+    zoom = min(2.0, math.sqrt(9_000_000 / max(1, page.rect.get_area())))
+    pix = page.get_pixmap(
+        matrix=pdf.Matrix(zoom, zoom), colorspace=pdf.csGRAY, annots=False
+    )
+    pixels = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width)
+    blank = pixels.min(axis=1) > 242
+    runs = np.flatnonzero(np.diff(np.r_[False, blank, False])).reshape(-1, 2)
+    seams = [(a / zoom, b / zoom) for a, b in runs if b - a >= 1.5 * zoom]
+
+    def edge(value):
+        near = [(a, b) for a, b in seams if a - 12 <= value <= b + 12]
+        if not near:
+            return None
+        a, b = min(near, key=lambda pair: max(pair[0] - value, value - pair[1], 0))
+        lo, hi = math.ceil(a + 0.25), math.floor(b - 0.25)
+        return (
+            min(hi, max(lo, round((max(a, value - 12) + min(b, value + 12)) / 2)))
+            if lo <= hi
+            else None
+        )
+
+    isolated = []
+    for box in result:
+        top, bottom = edge(box.y0), edge(box.y1)
+        if top is not None and bottom is not None and bottom - top >= 40:
+            isolated.append(pdf.Rect(box.x0, top, box.x1, bottom))
+    return isolated
+
+
 def find_figures(path, skip_last=0):
     found = []
     with pdf.open(path) as doc, PdfReader(path) as structure:
@@ -177,9 +284,10 @@ def find_figures(path, skip_last=0):
                 for box, text in blocks
                 if (m := CAPTION.match(text))
             ]
+            draws = page.get_drawings()
+            found.extend(Figure(index, box) for box in _display_math_regions(page, draws))
             if not captions:
                 continue
-            draws = page.get_drawings()
             table_captions = [
                 box for box, label in captions if label in ("table", "表")
             ]
@@ -313,6 +421,11 @@ def _erase(page, regions):
     page.apply_redactions(
         images=pdf.PDF_REDACT_IMAGE_NONE, graphics=pdf.PDF_REDACT_LINE_ART_NONE
     )
+    clip_out(page, regions)
+
+
+def clip_out(page, regions):
+    """Exclude regions from the old drawing without deleting neighbouring text."""
     page.wrap_contents()
     matrix = ~page.transformation_matrix
 

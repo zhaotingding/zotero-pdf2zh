@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+import numpy as np
 import pymupdf as pdf
 from pypdf import PdfWriter
 from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
@@ -31,6 +32,67 @@ def paper(path, caption):
 
 
 class VectorFiguresTests(unittest.TestCase):
+    def test_stacked_display_derivation_keeps_vector_ink_and_surrounding_prose(self):
+        with TemporaryDirectory() as tmp:
+            source = Path(tmp, "derivation.pdf")
+            with PdfWriter() as writer:
+                page = writer.add_blank_page(width=300, height=280)
+                faces = DictionaryObject()
+                for key, name in (
+                    ("/R", "/Helvetica"),
+                    ("/M", "/CMMI10"),
+                    ("/Big", "/CMEX10"),
+                ):
+                    faces[NameObject(key)] = writer._add_object(
+                        DictionaryObject(
+                            {
+                                NameObject("/Type"): NameObject("/Font"),
+                                NameObject("/Subtype"): NameObject("/Type1"),
+                                NameObject("/BaseFont"): NameObject(name),
+                                NameObject("/Encoding"): NameObject("/WinAnsiEncoding"),
+                            }
+                        )
+                    )
+                page[NameObject("/Resources")] = DictionaryObject(
+                    {NameObject("/Font"): faces}
+                )
+                ops = ["BT /R 10 Tf 20 240 Td (By the first bound, we obtain) Tj ET"]
+                for y in (215, 188, 160, 132):
+                    ops.extend(
+                        [
+                            f"BT /Big 14 Tf 35 {y} Td (P) Tj ET",
+                            f"BT /M 10 Tf 49 {y} Td (f+x-y+e+z-a+b+c=0) Tj ET",
+                        ]
+                    )
+                ops.append("BT /R 10 Tf 20 95 Td (The next argument follows.) Tj ET")
+                stream = DecodedStreamObject()
+                stream.set_data("\n".join(ops).encode())
+                page[NameObject("/Contents")] = writer._add_object(stream)
+                writer.write(source)
+            with prepare_vector_figures(str(source)) as (prepared, regions):
+                self.assertEqual(len(regions), 1)
+                restored = Path(tmp, "result.pdf")
+                shutil.copyfile(prepared, restored)
+                with pdf.open(prepared) as work:
+                    self.assertIn("By the first bound", work[0].get_text())
+                    self.assertIn("The next argument", work[0].get_text())
+                    self.assertEqual(len(work[0].get_image_info()), 1)
+                restore_vector_figures(source, [restored], regions)
+                with pdf.open(restored) as result, pdf.open(source) as original:
+                    self.assertEqual(
+                        result[0].get_text(sort=True), original[0].get_text(sort=True)
+                    )
+                    pixels = [
+                        np.asarray(
+                            p[0]
+                            .get_pixmap(matrix=pdf.Matrix(3, 3), colorspace=pdf.csGRAY)
+                            .pil_image()
+                        ).astype(np.int16)
+                        for p in (original, result)
+                    ]
+                    # Nested vector transforms can shift antialias samples by a few grey levels.
+                    self.assertLessEqual(np.abs(pixels[0] - pixels[1]).max(), 6)
+
     def test_only_math_rows_are_protected_between_table_rules(self):
         with TemporaryDirectory() as tmp:
             path = Path(tmp, "ruled-table.pdf")

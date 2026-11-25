@@ -20,6 +20,54 @@ def _sample_job(exit_early, *, progress):
 
 
 class WorkerTests(unittest.TestCase):
+    def test_layout_review_page_numbers_reach_the_client_and_task_history(self):
+        import server
+
+        def execute(_worker, args, _progress):
+            path = Path(args[4])
+            target = path.with_name("result.mono.pdf")
+            target.write_bytes(path.read_bytes())
+            return {
+                "status": "success",
+                "fileList": [target.name],
+                "layoutWarnings": {"mono": {2: ["分数线"]}},
+                "message": "成功生成 1 个文件；排版待核对的原文页码：2",
+            }
+
+        with pdf.open() as source:
+            source.new_page()
+            source.new_page()
+            data = base64.b64encode(source.tobytes()).decode()
+        with (
+            TemporaryDirectory() as tmp,
+            patch.object(server, "output_folder", tmp),
+            patch.object(server, "task_manager", TaskManager()),
+            patch.object(server, "run_isolated", side_effect=execute),
+        ):
+            processor = server.PDFTranslator(SimpleNamespace(enable_venv=False))
+            with processor.app.test_client() as client:
+                try:
+                    reply = client.post(
+                        "/translate",
+                        json={
+                            "fileName": "source.pdf",
+                            "fileContent": data,
+                            "engine": "pdf2zh_next",
+                            "service": "openai",
+                        },
+                    )
+                    self.assertEqual(reply.status_code, 200)
+                    self.assertIn("2", reply.json["layoutWarnings"]["mono"])
+                    job = client.get("/api/history").json["history"][0]
+                    self.assertEqual(
+                        job["result"]["layoutWarnings"], reply.json["layoutWarnings"]
+                    )
+                    self.assertIn("页码：2", job["result"]["message"])
+                    live = client.get("/api/tasks/" + job["taskId"]).json["task"]
+                    self.assertEqual(live["message"], reply.json["message"])
+                finally:
+                    processor.jobs.shutdown()
+
     def test_bad_process_does_not_break_next_job(self):
         events = []
         with self.assertRaisesRegex(RuntimeError, "0x00000017"):

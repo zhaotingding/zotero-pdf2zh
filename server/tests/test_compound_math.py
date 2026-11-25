@@ -25,6 +25,34 @@ def fraction_page(doc):
 
 
 class CompoundTests(unittest.TestCase):
+    def test_upright_label_on_a_nested_script_moves_with_its_fraction(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory, "stacked.pdf")
+            with pdf.open() as doc:
+                page = doc.new_page(width=210, height=100)
+                page.insert_font(
+                    fontname="Body", fontbuffer=pdf.Font("tiro").buffer, set_simple=True
+                )
+                for x, y, value, size in [
+                    (15, 50, "Compare", 10),
+                    (83, 44, "T", 8),
+                    (75, 53, "C", 8),
+                    (80.5, 51, "n", 5),
+                    (83.1, 49.4, "eval", 5),
+                    (115, 50, "ordinary eval text.", 10),
+                ]:
+                    page.insert_text((x, y), value, fontname="Body", fontsize=size)
+                page.draw_line((75, 46), (91, 46), width=0.45)
+                doc.save(path)
+            with prepare_compound_math(str(path)) as (prepared, maps):
+                self.assertTrue(maps)
+                with pdf.open(prepared) as proxy:
+                    self.assertIn("ordinary eval text", proxy[0].get_text())
+                    self.assertEqual(proxy[0].get_text().count("eval"), 1)
+                finalize_inline_fonts([prepared], maps)
+                with pdf.open(prepared) as restored:
+                    self.assertIn("TCneval", restored[0].get_text())
+
     def test_dual_keeps_the_authored_page_and_the_correct_translation_in_either_order(
         self,
     ):

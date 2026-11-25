@@ -58,11 +58,16 @@ def is_math_face(name):
     return bool(_MATH.match(name.split("+")[-1]))
 
 
+def math_words_only(value):
+    """Latin words in this run are named math functions or single operands."""
+    return all(word.lower() in _FUNCTIONS for word in _WORD.findall(value))
+
+
 def is_math_text(family, value):
     family = family.split("+")[-1]
     roman = re.match(r"(?:CM(?:R|BX|TI)\d|LMRoman)", family, re.IGNORECASE)
     return is_math_face(family) and (
-        not roman or all(w.lower() in _FUNCTIONS for w in _WORD.findall(value))
+        not roman or math_words_only(value)
     )
 
 
@@ -125,6 +130,19 @@ def _trace(page):
     return traces
 
 
+def _script_position(base, script, *, nested=False):
+    if base is None or script is None:
+        return False
+    last = base.glyphs[-1]
+    x, y = script.glyphs[0][2]
+    em = base.size * base.yscale
+    return (
+        0.38 <= script.size * script.yscale / em <= (1.02 if nested else 0.90)
+        and -0.23 * em <= x - last[3][2] <= 0.35 * em
+        and 0.075 * em <= abs(y - last[2][1]) <= 0.85 * em
+    )
+
+
 def _paints(page, ops, fonts, known_math):
     # Match simple-font bytes to the actual glyphs in paint order. A different count
     # (e.g. a nested Form reusing the face) disqualifies the face on this page.
@@ -136,6 +154,7 @@ def _paints(page, ops, fonts, known_math):
             faces[name] = str(font.get("/BaseFont", "")).split("+")[-1].lstrip("/")
     offsets = Counter()
     text_shows = []
+    upright_labels = set()
     ctm = tm = pdf.Matrix(1, 1)
     font, size = None, 0
     params = {b"Tc": 0.0, b"Tw": 0.0, b"Tz": 100.0, b"Ts": 0.0, b"Tr": 0.0}
@@ -187,10 +206,11 @@ def _paints(page, ops, fonts, known_math):
                     # operand. Text alone is insufficient evidence on those pages.
                     math = (
                         bool(value.strip())
-                        and all(w.lower() in _FUNCTIONS for w in _WORD.findall(value))
+                        and math_words_only(value)
                         and "\ufffd" not in value
                     )
-                if math or value.strip() in {"=", ":=", "≤", "≥", "+", "−"}:
+                label = not math and re.fullmatch(r"[^\W\d_][\w-]*", value)
+                if math or label or value.strip() in {"=", ":=", "≤", "≥", "+", "−"}:
                     face = fonts[font]
                     widths = face.get("/Widths")
                     if widths is not None:
@@ -204,13 +224,25 @@ def _paints(page, ops, fonts, known_math):
                             float(v) for v in parts if not isinstance(v, bytes)
                         )
                         paint = Paint(i, font, size, mx.a, mx.d, data, chars, delta)
+                        if label:
+                            upright_labels.add(i)
             text_shows.append((family, paint))
         elif op in (b"Do", b"BI", b"INLINE IMAGE"):
             text_shows.append((None, None))
-    return [
+    paints = [
         paint if offsets[face] == len(traces.get(face, ())) else None
         for face, paint in text_shows
-    ], faces
+    ]
+    # 用真实基线和字号识别正体上下标。单独出现的同样单词仍然交给正文翻译。
+    for i, paint in enumerate(paints):
+        if paint is None or paint.index not in upright_labels:
+            continue
+        base = paints[i - 1] if i else None
+        # TeX 在最小脚注字号下可用同一字号继续嵌套一层上标，再比较一次基线。
+        nested = i >= 2 and _script_position(paints[i - 2], base)
+        if not _script_position(base, paint, nested=nested):
+            paints[i] = None
+    return paints, faces
 
 
 def _rules(page, ops):

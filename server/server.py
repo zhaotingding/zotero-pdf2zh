@@ -20,9 +20,10 @@ from utils.config import Config
 from utils.config_map import pdf2zh_next_service_aliases
 from utils.config_migration import prepare_config_files
 from utils.cropper import Cropper
-from utils.auto_outline import attach_outlines
+from utils.auto_outline import add_review_bookmarks, attach_outlines
 from utils.compound_math import prepare_compound_math, restore_dual_source
 from utils.inline_fractions import finalize_inline_fonts, prepare_inline_fractions
+from utils.layout_repair import check_output
 from utils.page_overlay import repair_translation_outputs
 from utils.vector_figures import prepare_vector_figures, restore_vector_figures
 import traceback
@@ -465,13 +466,16 @@ class PDFTranslator:
                 else:
                     os.replace(product, destination)
             payload = self._success_files_payload([str(Path(output_folder, name)) for name in names])
+            if result.get("layoutWarnings"):
+                payload["layoutWarnings"] = result["layoutWarnings"]
+                payload["message"] = result["message"]
             if scoped:
                 payload["taskFiles"] = True
                 payload["taskId"] = task_id
                 payload["filePaths"] = [str(path.parent / name) for name in names]
                 task_manager.keep_result(task_id, work, names)
                 kept = True
-            task_manager.complete_task(task_id, "success", "PDF 已生成", file_list=names,
+            task_manager.complete_task(task_id, "success", payload.get("message", "PDF 已生成"), file_list=names,
                                        file_paths=payload["filePaths"], output_dir=output_folder, result=payload)
             return payload
         except Exception as exc:
@@ -723,10 +727,27 @@ class PDFTranslator:
             print("⚠️ 自动补大纲未完成，仍然返回已经生成的译本。")
             traceback.print_exc()
         payload = self._success_files_payload(existing)
+        reviews = getattr(config, "layout_warnings", {})
+        if reviews:
+            returned_layouts = {
+                "mono" if self.get_filetype(path) in ("mono", "mono-cut") else config.dual_mode
+                for path in existing
+            }
+            reviews = {layout: notes for layout, notes in reviews.items() if layout in returned_layouts}
+        message = f'成功生成 {len(existing)} 个文件'
+        if reviews:
+            pages = sorted({n for warnings in reviews.values() for n in warnings})
+            message += '；排版待核对的原文页码：' + '、'.join(map(str, pages))
+            payload.update(layoutWarnings=reviews, message=message)
+            print(message)
+            try:
+                add_review_bookmarks(existing, reviews, config, self)
+            except (OSError, RuntimeError, ValueError) as exc:
+                print(f"排版待核对页码已保存在任务结果中，附加书签未写入：{exc}")
         task_manager.complete_task(
             task_id,
             'success',
-            f'成功生成 {len(existing)} 个文件',
+            message,
             file_list=payload['fileList'],
             file_paths=payload['filePaths'],
             output_dir=payload['outputDir'],
@@ -1156,6 +1177,19 @@ class PDFTranslator:
         repair_translation_outputs(input_path, outputs)
         if compounds:
             restore_dual_source(input_path, outputs, config)
+        config.layout_warnings = {}
+        for path in outputs:
+            layout = config.dual_mode if str(path).lower().endswith('.dual.pdf') else 'mono'
+            first = layout == 'mono' or config.trans_first or config.enhance_compatibility
+
+            def progress(page, total):
+                if task_id:
+                    task_manager.update_task(task_id, {"message": f"正在核对成品排版（{layout}），第 {page}/{total} 页"})
+
+            fixed, review = check_output(input_path, path, layout, first, config.skip_last_pages, progress=progress)
+            print(f"排版检查（{layout}）：已修复 {fixed} 处，待核对原文页码 {sorted(review)}")
+            if review:
+                config.layout_warnings[layout] = review
         return outputs
 
     def _run_pdf2zh_next(self, input_path, config, task_id=None):
