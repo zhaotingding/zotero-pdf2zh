@@ -3,7 +3,8 @@
 ## 工作区
 
 - 本仓库包含 Zotero 插件和 Python 翻译服务。插件源码在 `plugin/src`，界面与清单在 `plugin/addon`，后端入口为 `server/server.py`。
-- 桌面快捷方式用外层 `runtime/python.exe` 执行本仓库的 `start_service.py`，随后直接运行 `source/server/server.py`。快捷方式通过 `--data-dir` 指向外层 `server/`，其中的 `config/` 与 `translated/` 继续保存个人配置和译文；默认配置模板随本仓库维护。OpenAI 凭据由 Windows 凭据管理器提供。
+- 桌面快捷方式用外层 `runtime/python.exe` 执行本仓库的 `start_service.py`，随后直接运行 `source/server/server.py`。安装目录的同名旧入口也转发至此。快捷方式通过 `--data-dir` 指向外层 `server/`，其中的 `config/` 与 `translated/` 继续保存个人配置和译文；默认配置模板随本仓库维护。
+- 每次翻译使用 Zotero 提交时激活的 API 档案，包括地址、密钥、模型和额外参数。任务配置与共享文件隔离。仅当 Windows 个人版的 OpenAI 任务没有激活档案时，才用既有 PDF2zh 专用凭据连接官方默认地址。
 - Windows 个人版的「翻译 PDF」在本机 8890 端口未就绪时启动桌面的 `Zotero PDF2zh 翻译服务.lnk`，等待健康检查通过后再提交文件。多个翻译批次共用一次启动；远程服务按插件中配置的地址直接访问。
 - 开发提交或合入上游后，等当前翻译完成，关闭服务窗口并重新双击快捷方式即可加载后端改动。`http://127.0.0.1:8890/health` 中的 `serverFile` 和 `sourceRevision` 可核对实际运行的源码和启动修订；修订末尾的 `-dirty` 表示启动时有未提交的跟踪文件改动。插件前端的改动仍需重新构建和安装 XPI。
 - 保留用户已有代码、配置和文字修改。Git 只纳入相关源码和上游示例配置。运行环境、缓存、个人论文、译文、实际 API 配置和密钥留在部署目录。

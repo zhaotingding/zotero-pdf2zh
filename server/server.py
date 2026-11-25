@@ -1111,7 +1111,6 @@ class PDFTranslator:
 
     def translate_pdf(self, input_path, config, task_id=None):
         # TODO: 如果翻译失败了, 自动执行跳过字体子集化, 并且显示生成的文件的大小
-        config.update_config_file(config_path[pdf2zh])
         if config.targetLang == 'zh-CN': # TOFIX, pdf2zh 1.x converter没有通过
             config.targetLang = 'zh'
         if config.sourceLang == 'zh-CN': # TOFIX, pdf2zh 1.x converter没有通过
@@ -1124,7 +1123,6 @@ class PDFTranslator:
             '--service', str(config.service),
             '--lang-in', str(config.sourceLang),
             '--lang-out', str(config.targetLang),
-            '--config', str(config_path[pdf2zh]), # 使用默认的config path路径
         ]
 
         if config.skip_last_pages and config.skip_last_pages > 0:
@@ -1137,14 +1135,15 @@ class PDFTranslator:
         if config.babeldoc:
             print("🔍 [Zotero PDF2zh Server] 目前不推荐使用pdf2zh 1.x + babeldoc, 如有需要，请直接使用pdf2zh_next")
             cmd.append('--babeldoc')
-        try:
-            # 使用 execute_with_progress 替代原来的 execute_in_env / subprocess.run
-            # 实时解析子进程输出中的进度信息并更新 task_manager
-            execute_with_progress(cmd, task_id, args, self.env_manager if args.enable_venv else None)
-        except subprocess.CalledProcessError as e:
-            print(f"⚠️ 翻译失败, 错误信息: {e}, 尝试跳过字体子集化, 重新渲染\n")
-            cmd.append('--skip-subset-fonts')
-            execute_with_progress(cmd, task_id, args, self.env_manager if args.enable_venv else None)
+        with config.task_config(config_path[pdf2zh], work_dir=output_folder) as task_file:
+            cmd.extend(['--config', task_file])
+            env_manager = self.env_manager if args.enable_venv else None
+            try:
+                execute_with_progress(cmd, task_id, args, env_manager, config=config)
+            except subprocess.CalledProcessError as e:
+                print(f"⚠️ 翻译失败, 错误信息: {e}, 尝试跳过字体子集化, 重新渲染\n")
+                cmd.append('--skip-subset-fonts')
+                execute_with_progress(cmd, task_id, args, env_manager, config=config)
         fileName = os.path.splitext(os.path.basename(input_path))[0]
         if config.babeldoc:
             output_path_mono = os.path.join(output_folder, f"{fileName}.{config.targetLang}.mono.pdf")
@@ -1195,8 +1194,10 @@ class PDFTranslator:
     def _run_pdf2zh_next(self, input_path, config, task_id=None):
         if config.service in pdf2zh_next_service_aliases:
             config.service = pdf2zh_next_service_aliases[config.service]
-        config.update_config_file(config_path[pdf2zh_next])
+        with config.task_config(config_path[pdf2zh_next], work_dir=output_folder) as task_file:
+            return self._invoke_pdf2zh_next(input_path, config, task_id, task_file)
 
+    def _invoke_pdf2zh_next(self, input_path, config, task_id, task_file):
         cmd = [
             pdf2zh_next,
             input_path,
@@ -1205,7 +1206,7 @@ class PDFTranslator:
             '--output', str(output_folder),
             '--lang-in', str(config.sourceLang),
             '--lang-out', str(config.targetLang),
-            '--config-file', str(config_path[pdf2zh_next]), # 使用默认的config path路径
+            '--config-file', task_file,
         ]
         # TODO: 增加术语表的地址
         if config.no_watermark:
@@ -1243,8 +1244,6 @@ class PDFTranslator:
             cmd.append('--auto-enable-ocr-workaround')
         if config.font_family and config.font_family in ['serif', 'sans-serif', 'script']:
             cmd.extend(['--primary-font-family', config.font_family])
-        if config.pool_size and config.pool_size > 1:
-            cmd.extend(['--pool-max-worker', str(config.pool_size)])
 
         fileName = os.path.splitext(os.path.basename(input_path))[0]
         no_watermark_mono = os.path.join(output_folder, f"{fileName}.no_watermark.{config.targetLang}.mono.pdf")
@@ -1300,6 +1299,7 @@ class PDFTranslator:
                     cmd,
                     shell=False,
                     cwd=exe_dir,
+                    env=config.engine_environment(os.environ.copy()),
                     stderr=subprocess.PIPE,
                     text=True,
                     bufsize=1,
@@ -1330,6 +1330,7 @@ class PDFTranslator:
                     cmd,
                     shell=False,
                     cwd=exe_dir,
+                    env=config.engine_environment(os.environ.copy()),
                     creationflags=CREATE_NO_WINDOW,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
@@ -1344,9 +1345,9 @@ class PDFTranslator:
         elif args.enable_venv:
             # 使用 execute_with_progress 替代原来的 execute_in_env
             # 实时解析子进程输出中的进度信息并更新 task_manager
-            execute_with_progress(cmd, task_id, args, self.env_manager)
+            execute_with_progress(cmd, task_id, args, self.env_manager, config=config)
         else:
-            execute_with_progress(cmd, task_id, args, None)
+            execute_with_progress(cmd, task_id, args, None, config=config)
         existing = [p for p in output_path if os.path.exists(p)]
 
         for f in existing:

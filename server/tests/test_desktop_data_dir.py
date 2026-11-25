@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 class DesktopDataDirectoryTest(unittest.TestCase):
@@ -13,13 +13,12 @@ class DesktopDataDirectoryTest(unittest.TestCase):
     def test_launcher_creates_one_visible_service_console_only_on_cold_start(self):
         import subprocess
         import sys
-        from unittest.mock import Mock
 
         entry = Path(__file__).resolve().parents[2] / "start_service.py"
         main = runpy.run_path(str(entry))["main"]
-        need_key = Mock(return_value="offline-test")
         with (
-            patch.dict(main.__globals__, {"Tk": Mock(), "api_key": need_key}),
+            patch.dict(main.__globals__, {"Tk": Mock()}),
+            patch.dict(os.environ, clear=True, PATH="fixture-path"),
             patch("socket.socket") as probe,
             patch("subprocess.check_output", return_value="test-revision"),
             patch("subprocess.Popen") as launch,
@@ -38,10 +37,11 @@ class DesktopDataDirectoryTest(unittest.TestCase):
                 options["startupinfo"].dwFlags & subprocess.STARTF_USESHOWWINDOW
             )
             self.assertEqual(options["startupinfo"].wShowWindow, 1)
+            self.assertEqual(options["env"]["ZOTERO_PDF2ZH_DESKTOP"], "1")
+            self.assertFalse(any(key.startswith("PDF2ZH_OPENAI_") for key in options["env"]))
             check.return_value = 0
             main()
             launch.assert_called_once()
-            need_key.assert_called_once()
 
     def test_checkout_serves_existing_files_and_migrates_from_its_own_templates(self):
         entry = Path(__file__).resolve().parents[1] / "server.py"
